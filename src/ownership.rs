@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use crate::app::CommitEntry;
+use crate::cache::storage_dir;
+use crate::git::Commit;
+use crate::util::{load_or_default, write_atomic};
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct OwnershipData {
@@ -17,21 +19,16 @@ pub struct OwnershipData {
 pub fn compute(
     repo: &Repository,
     git_dir: &Path,
-    commits: &[CommitEntry],
+    commits: &[Commit],
     on_progress: impl Fn(usize, usize),
 ) -> Result<OwnershipData> {
     let head = repo.head()?.peel_to_commit()?;
     let head_hash = head.id().to_string();
 
-    let cache_path = git_dir.join("gild").join("ownership.json");
-    if cache_path.exists() {
-        if let Ok(s) = fs::read_to_string(&cache_path) {
-            if let Ok(cached) = serde_json::from_str::<OwnershipData>(&s) {
-                if cached.head == head_hash {
-                    return Ok(cached);
-                }
-            }
-        }
+    let cache_path = storage_dir(git_dir).join("ownership.json");
+    let cached: OwnershipData = load_or_default(&cache_path, |s| serde_json::from_str(s));
+    if cached.head == head_hash && !cached.authors.is_empty() {
+        return Ok(cached);
     }
 
     let tree = head.tree()?;
@@ -43,9 +40,10 @@ pub fn compute(
     let mut file_owner: HashMap<&str, usize> = HashMap::new();
     for commit in commits {
         for file in &commit.files {
-            if file_sizes.contains_key(file.as_str()) && !file_owner.contains_key(file.as_str()) {
-                file_owner.insert(file, commit.group_id);
+            if !file_sizes.contains_key(file.as_str()) {
+                continue;
             }
+            file_owner.entry(file.as_str()).or_insert(commit.group_id);
         }
     }
 
@@ -69,11 +67,8 @@ pub fn compute(
         authors: group_lines,
     };
 
-    let dir = git_dir.join("gild");
-    fs::create_dir_all(&dir)?;
-    let tmp = cache_path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_string(&result)?)?;
-    fs::rename(&tmp, &cache_path)?;
+    fs::create_dir_all(storage_dir(git_dir))?;
+    write_atomic(&cache_path, serde_json::to_string(&result)?.as_bytes())?;
 
     Ok(result)
 }
@@ -107,38 +102,39 @@ fn count_lines(content: &[u8]) -> usize {
     if content.is_empty() {
         return 0;
     }
-    let mut count = 0;
-    for &byte in content {
-        if byte == b'\n' {
-            count += 1;
-        }
-    }
-    if *content.last().unwrap() != b'\n' {
-        count += 1;
-    }
-    count
+    let nl = bytecount(content, b'\n');
+    if *content.last().unwrap() == b'\n' { nl } else { nl + 1 }
 }
 
+fn bytecount(haystack: &[u8], needle: u8) -> usize {
+    haystack.iter().filter(|&&b| b == needle).count()
+}
+
+const BINARY_EXTS: &[&str] = &[
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".zip", ".gz", ".tar", ".bz2", ".xz", ".7z", ".rar",
+    ".exe", ".dll", ".so", ".dylib", ".a", ".o", ".obj",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt",
+    ".mp3", ".mp4", ".avi", ".mov", ".wav", ".flac",
+    ".pyc", ".class", ".wasm",
+    ".lock", ".min.js", ".min.css",
+    ".map", ".snap",
+    ".db", ".sqlite", ".sqlite3",
+    ".jar", ".war", ".ear",
+    ".dmg", ".iso", ".img",
+    ".tgz", ".gem", ".deb", ".rpm",
+    ".psd", ".ai", ".sketch",
+    ".DS_Store",
+];
+
 fn is_likely_binary(path: &str) -> bool {
-    let binary_exts = [
-        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg",
-        ".woff", ".woff2", ".ttf", ".eot", ".otf",
-        ".zip", ".gz", ".tar", ".bz2", ".xz", ".7z", ".rar",
-        ".exe", ".dll", ".so", ".dylib", ".a", ".o", ".obj",
-        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt",
-        ".mp3", ".mp4", ".avi", ".mov", ".wav", ".flac",
-        ".pyc", ".class", ".wasm",
-        ".lock", ".min.js", ".min.css",
-        ".map", ".snap",
-        ".db", ".sqlite", ".sqlite3",
-        ".jar", ".war", ".ear",
-        ".dmg", ".iso", ".img",
-        ".tgz", ".gem", ".deb", ".rpm",
-        ".psd", ".ai", ".sketch",
-        ".DS_Store",
-    ];
-    let lower = path.to_lowercase();
-    binary_exts.iter().any(|ext| lower.ends_with(ext))
+    let bytes = path.as_bytes();
+    BINARY_EXTS.iter().any(|ext| {
+        let ext_bytes = ext.as_bytes();
+        bytes.len() >= ext_bytes.len()
+            && bytes[bytes.len() - ext_bytes.len()..].eq_ignore_ascii_case(ext_bytes)
+    })
 }
 
 pub fn map_to_groups(

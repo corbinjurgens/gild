@@ -1,6 +1,6 @@
 use crate::app::{App, AuthorStats};
+use crate::fmt::{fmt_date, fmt_num};
 use anyhow::Result;
-use chrono::DateTime;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -29,9 +29,8 @@ pub fn export(app: &App, format: &str, output: Option<&Path>) -> Result<()> {
 }
 
 fn export_json(app: &App) -> Result<String> {
-    let sorted = app.sorted_authors();
-    let authors: Vec<serde_json::Value> = sorted
-        .iter()
+    let authors: Vec<serde_json::Value> = app
+        .sorted_authors()
         .enumerate()
         .map(|(i, a)| author_to_json(i + 1, a))
         .collect();
@@ -58,8 +57,8 @@ fn author_to_json(rank: usize, a: &AuthorStats) -> serde_json::Value {
         "net_lines": a.lines_added as i64 - a.lines_removed as i64,
         "files_changed": a.files_changed,
         "impact": (a.impact * 10.0).round() / 10.0,
-        "first_commit": format_date(a.first_commit),
-        "last_commit": format_date(a.last_commit),
+        "first_commit": fmt_date(a.first_commit, "%Y-%m-%d"),
+        "last_commit": fmt_date(a.last_commit, "%Y-%m-%d"),
     });
 
     if a.ownership_lines > 0 {
@@ -67,19 +66,29 @@ fn author_to_json(rank: usize, a: &AuthorStats) -> serde_json::Value {
         obj["ownership_pct"] = serde_json::json!((a.ownership_pct * 10.0).round() / 10.0);
     }
 
+    let ct = &a.change_types;
+    obj["change_types"] = serde_json::json!({
+        "feature": ct.feature,
+        "refactor": ct.refactor,
+        "trivial": ct.trivial,
+        "new_files": ct.new_files,
+        "deleted_files": ct.deleted_files,
+        "whitespace_lines": ct.whitespace_lines,
+    });
+
     obj
 }
 
 fn export_csv(app: &App) -> String {
-    let sorted = app.sorted_authors();
     let mut out = String::from(
-        "Rank,Author,Commits,Lines Added,Lines Removed,Net Lines,Files Changed,Impact,Ownership Lines,Ownership %,First Commit,Last Commit\n",
+        "Rank,Author,Commits,Lines Added,Lines Removed,Net Lines,Files Changed,Impact,Ownership Lines,Ownership %,Feature,Refactor,Trivial,New Files,Deleted Files,Whitespace Lines,First Commit,Last Commit\n",
     );
 
-    for (i, a) in sorted.iter().enumerate() {
+    for (i, a) in app.sorted_authors().enumerate() {
         let net = a.lines_added as i64 - a.lines_removed as i64;
+        let ct = &a.change_types;
         out.push_str(&format!(
-            "{},\"{}\",{},{},{},{},{},{:.1},{},{:.1},{},{}\n",
+            "{},\"{}\",{},{},{},{},{},{:.1},{},{:.1},{},{},{},{},{},{},{},{}\n",
             i + 1,
             a.display_name.replace('"', "\"\""),
             a.commits,
@@ -90,8 +99,14 @@ fn export_csv(app: &App) -> String {
             a.impact,
             a.ownership_lines,
             a.ownership_pct,
-            format_date(a.first_commit),
-            format_date(a.last_commit),
+            ct.feature,
+            ct.refactor,
+            ct.trivial,
+            ct.new_files,
+            ct.deleted_files,
+            ct.whitespace_lines,
+            fmt_date(a.first_commit, "%Y-%m-%d"),
+            fmt_date(a.last_commit, "%Y-%m-%d"),
         ));
     }
 
@@ -99,11 +114,15 @@ fn export_csv(app: &App) -> String {
 }
 
 fn export_html(app: &App) -> String {
-    let sorted = app.sorted_authors();
-    let max_impact = sorted.first().map(|a| a.impact).unwrap_or(1.0).max(1.0);
+    let max_impact = app
+        .sorted_authors()
+        .next()
+        .map(|a| a.impact)
+        .unwrap_or(1.0)
+        .max(1.0);
 
     let mut rows = String::new();
-    for (i, a) in sorted.iter().enumerate() {
+    for (i, a) in app.sorted_authors().enumerate() {
         let rank = i + 1;
         let net = a.lines_added as i64 - a.lines_removed as i64;
         let net_class = if net >= 0 { "added" } else { "removed" };
@@ -190,27 +209,16 @@ tr:hover {{ background:#44475a; }}
     )
 }
 
-fn format_date(ts: i64) -> String {
-    DateTime::from_timestamp(ts, 0)
-        .map(|dt| dt.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn fmt_num(n: usize) -> String {
-    let s = n.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    result.chars().rev().collect()
-}
-
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }

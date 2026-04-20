@@ -74,10 +74,22 @@ Run `gild` with no arguments to analyze the current directory.
 
 ## How it works
 
-- **Impact scoring** — sessions of commits within 30-minute gaps are grouped; impact uses a logarithmic formula weighing lines and files touched, rewarding focused effort over raw volume
+- **Impact scoring** — measures total work substance, not commit count. The base score is `(1 + ln(1 + lines)) × (1 + 0.5 × ln(1 + unique_files))` computed on all lines added/removed and unique files touched (not double-counted across commits). A small consistency bonus `× (1 + 0.15 × ln(sessions))` rewards regular activity, where sessions are commit groups separated by 30-minute gaps. This means someone who makes 1 clean commit with 200 lines scores higher than someone who makes 5 typo-fix commits totaling 25 lines — commit-splitting can't inflate impact
 - **Identity deduplication** — union-find merges authors by email, `.mailmap`, and saved confirmations; an interactive questionnaire catches fuzzy matches (Levenshtein, substring, email heuristics)
 - **Code ownership** — for each file in HEAD, finds the most recent commit that touched it and counts lines; cached per HEAD hash in `.git/gild/ownership.json`
 - **Caching** — commit stats cached in `.git/gild/cache.json` by hash; subsequent runs are near-instant
+
+## How merges are counted
+
+Gild walks all commits reachable from HEAD, deduplicated by hash. Each commit is counted exactly once regardless of how many branches it's reachable through.
+
+| Merge strategy | How it's counted |
+|----------------|-----------------|
+| **Regular merge** | Original branch commits keep their hashes and are attributed to the original author. The merge commit itself is separate (usually 0 lines unless conflict resolution). |
+| **Fast-forward** | No merge commit created. Original commits become part of the branch as-is. |
+| **Squash merge** | Original branch commits are **not** in the target history. A single new commit is created — attributed to whoever performed the merge, not the original authors. |
+
+If your team uses squash merges, contribution data will be skewed toward the person merging. This is a git-level limitation — the original commits aren't reachable from HEAD after a squash.
 
 ## Export formats
 

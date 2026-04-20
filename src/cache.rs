@@ -1,24 +1,18 @@
+use crate::git::Commit;
+use crate::util::{load_or_default, write_atomic};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct CachedCommit {
-    pub author_name: String,
-    pub author_email: String,
-    pub lines_added: usize,
-    pub lines_removed: usize,
-    pub files_changed: usize,
-    pub timestamp: i64,
-    #[serde(default)]
-    pub files: Vec<String>,
-}
+pub const CACHE_SCHEMA_VERSION: u8 = 3;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Cache {
-    pub commits: HashMap<String, CachedCommit>,
+    #[serde(default)]
+    pub schema_version: u8,
+    pub commits: HashMap<String, Commit>,
     #[serde(skip)]
     dirty: bool,
 }
@@ -37,37 +31,33 @@ pub fn identities_path(repo_git_dir: &Path) -> PathBuf {
 
 impl Cache {
     pub fn load(repo_git_dir: &Path) -> Self {
-        let path = cache_path(repo_git_dir);
-        if path.exists() {
-            fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default()
-        } else {
-            Self::default()
+        let loaded: Self =
+            load_or_default(&cache_path(repo_git_dir), |s| serde_json::from_str::<Self>(s));
+        if loaded.schema_version != CACHE_SCHEMA_VERSION {
+            return Self {
+                schema_version: CACHE_SCHEMA_VERSION,
+                ..Default::default()
+            };
         }
+        loaded
     }
 
     pub fn save(&self, repo_git_dir: &Path) -> Result<()> {
         if !self.dirty {
             return Ok(());
         }
-        let dir = storage_dir(repo_git_dir);
-        fs::create_dir_all(&dir)?;
-        let final_path = cache_path(repo_git_dir);
-        let tmp_path = final_path.with_extension("json.tmp");
+        fs::create_dir_all(storage_dir(repo_git_dir))?;
         let json = serde_json::to_string(&self)?;
-        fs::write(&tmp_path, json)?;
-        fs::rename(&tmp_path, &final_path)?;
-        Ok(())
+        write_atomic(&cache_path(repo_git_dir), json.as_bytes())
     }
 
-    pub fn get(&self, hash: &str) -> Option<&CachedCommit> {
+    pub fn get(&self, hash: &str) -> Option<&Commit> {
         self.commits.get(hash)
     }
 
-    pub fn insert(&mut self, hash: String, commit: CachedCommit) {
+    pub fn insert(&mut self, hash: String, commit: Commit) {
         self.commits.insert(hash, commit);
         self.dirty = true;
+        self.schema_version = CACHE_SCHEMA_VERSION;
     }
 }

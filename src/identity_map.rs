@@ -1,6 +1,6 @@
+use crate::util::{load_or_default, write_atomic};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::Path;
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -43,14 +43,7 @@ pub fn parse_identity(s: &str) -> Option<(String, String)> {
 
 impl IdentityMap {
     pub fn load(path: &Path) -> Self {
-        if path.exists() {
-            fs::read_to_string(path)
-                .ok()
-                .and_then(|s| toml::from_str(&s).ok())
-                .unwrap_or_default()
-        } else {
-            Self::default()
-        }
+        load_or_default(path, |s| toml::from_str::<Self>(s))
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -64,10 +57,7 @@ impl IdentityMap {
              # Edit freely. Changes take effect on next run.\n\n",
         );
         out.push_str(&toml::to_string(self)?);
-        let tmp_path = path.with_extension("toml.tmp");
-        fs::write(&tmp_path, out)?;
-        fs::rename(&tmp_path, path)?;
-        Ok(())
+        write_atomic(path, out.as_bytes())
     }
 
     fn pair_matches(list: &[MapPair], a: &str, b: &str) -> bool {

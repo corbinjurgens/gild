@@ -1,48 +1,298 @@
-use crate::app::{App, SortMode, ViewMode};
+use crate::app::{App, FileEvent, SortMode, Theme, ViewMode};
+use crate::fmt::{fmt_date, fmt_num};
 use anyhow::Result;
-use chrono::DateTime;
 use crossterm::event::{self, Event};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 use ratatui::Terminal;
 use std::io;
 use std::time::Duration;
 
 const GOLD: Color = Color::Rgb(255, 215, 0);
+const GILD_AMBER: Color = Color::Rgb(0xf1, 0x8f, 0x3b);
+const GILD_SPARK: Color = Color::Rgb(0xff, 0xcb, 0x7a);
 const SILVER: Color = Color::Rgb(192, 192, 192);
 const BRONZE: Color = Color::Rgb(205, 127, 50);
 const ADDED: Color = Color::Rgb(80, 250, 123);
 const REMOVED: Color = Color::Rgb(255, 85, 85);
 const HEADER_COLOR: Color = Color::Rgb(139, 233, 253);
 const DIM: Color = Color::Rgb(108, 118, 148);
+const BORDER_TEAL: Color = Color::Rgb(0x4a, 0x93, 0x8f);
 const BAR_FULL: Color = Color::Rgb(189, 147, 249);
-const BAR_EMPTY: Color = Color::Rgb(68, 71, 90);
-const ACTIVE_SORT: Color = Color::Rgb(80, 250, 123);
 
-const HEAT_COLORS: [Color; 5] = [
-    Color::Rgb(68, 71, 90),
-    Color::Rgb(54, 120, 88),
-    Color::Rgb(57, 170, 96),
-    Color::Rgb(62, 210, 105),
-    Color::Rgb(80, 250, 123),
+const ACTIVE_SORT: Color = Color::Rgb(80, 250, 123);
+const EMPTY_WEEKDAY: Color = Color::Rgb(255, 184, 108);
+
+type Stop = (f64, (u8, u8, u8));
+
+// Heat palette used by the activity pattern AND Top Files bar:
+// near-bg → cool steel → teal → amber → gold
+const HEAT_STOPS: [Stop; 5] = [
+    (0.00, (0x28, 0x2a, 0x36)),
+    (0.25, (0x37, 0x41, 0x60)),
+    (0.50, (0x4a, 0x93, 0x8f)),
+    (0.75, (0xf1, 0x8f, 0x3b)),
+    (1.00, (0xfb, 0xbf, 0x24)),
 ];
 
+// Impact column: blue throughout — no pure white at the top, stays on-theme
+const SPARKLE_STOPS: [Stop; 4] = [
+    (0.00, (0x5a, 0x9c, 0xd6)),
+    (0.40, (0x7b, 0xb8, 0xe8)),
+    (0.70, (0xa0, 0xd4, 0xf4)),
+    (1.00, (0xd5, 0xec, 0xff)),
+];
+
+// Value-driven ownership %: muted blue → cyan → green → orange → gold
+const OWNERSHIP_STOPS: [Stop; 5] = [
+    (0.00, (0x62, 0x72, 0xa4)),
+    (0.30, (0x8b, 0xe9, 0xfd)),
+    (0.50, (0x50, 0xfa, 0x7b)),
+    (0.70, (0xff, 0xb8, 0x6c)),
+    (1.00, (0xff, 0xd7, 0x00)),
+];
+
+// Value-driven noise %: green (clean) → yellow → orange → red (noisy)
+const NOISE_STOPS: [Stop; 4] = [
+    (0.00, (0x50, 0xfa, 0x7b)),
+    (0.30, (0xf1, 0xfa, 0x8c)),
+    (0.60, (0xff, 0xb8, 0x6c)),
+    (1.00, (0xff, 0x55, 0x55)),
+];
+
+fn lerp_u8(a: u8, b: u8, t: f64) -> u8 {
+    (a as f64 + (b as f64 - a as f64) * t)
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
+fn scale_color(base: Color, factor: f64) -> Color {
+    let (r, g, b) = match base {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::White => (255, 255, 255),
+        Color::Black => (0, 0, 0),
+        _ => return base,
+    };
+    let f = factor.clamp(0.0, 1.0);
+    Color::Rgb(
+        ((r as f64) * f).round() as u8,
+        ((g as f64) * f).round() as u8,
+        ((b as f64) * f).round() as u8,
+    )
+}
+
+/// Returns a brightness factor in [0.9, 1.0] for `value` within [min, max].
+/// The column's max sits at full brightness; the column's min sits 10% dimmer.
+fn dim_factor(value: f64, min: f64, max: f64) -> f64 {
+    if max <= min {
+        return 1.0;
+    }
+    let t = ((value - min) / (max - min)).clamp(0.0, 1.0);
+    0.9 + 0.1 * t
+}
+
+fn gradient_color(stops: &[Stop], t: f64) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let mut i = 0;
+    while i + 1 < stops.len() && stops[i + 1].0 < t {
+        i += 1;
+    }
+    if i + 1 >= stops.len() {
+        let (r, g, b) = stops[stops.len() - 1].1;
+        return Color::Rgb(r, g, b);
+    }
+    let (t0, (r0, g0, b0)) = stops[i];
+    let (t1, (r1, g1, b1)) = stops[i + 1];
+    let local = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
+    Color::Rgb(
+        lerp_u8(r0, r1, local),
+        lerp_u8(g0, g1, local),
+        lerp_u8(b0, b1, local),
+    )
+}
+
+fn dim<'a, T: Into<std::borrow::Cow<'a, str>>>(text: T) -> Span<'a> {
+    Span::styled(text, Style::default().fg(DIM))
+}
+
+fn fg<'a, T: Into<std::borrow::Cow<'a, str>>>(text: T, color: Color) -> Span<'a> {
+    Span::styled(text, Style::default().fg(color))
+}
+
+fn bold_fg<'a, T: Into<std::borrow::Cow<'a, str>>>(text: T, color: Color) -> Span<'a> {
+    Span::styled(text, Style::default().fg(color).add_modifier(Modifier::BOLD))
+}
+
+fn impact_header(is_sorted: bool, width: usize) -> Cell<'static> {
+    const NAME: &str = "Impact";
+    let sparkle_color = Color::Rgb(0xff, 0xff, 0xff);
+    let name_color = Color::Rgb(0x89, 0xdd, 0xff);
+
+    let content_len = 2 + NAME.chars().count() + if is_sorted { 2 } else { 0 };
+    let pad = width.saturating_sub(content_len);
+
+    let mut spans = vec![
+        Span::raw(" ".repeat(pad)),
+        Span::styled(
+            "\u{2726} ",
+            Style::default().fg(sparkle_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            NAME,
+            Style::default().fg(name_color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    if is_sorted {
+        spans.push(Span::styled(
+            " \u{25be}",
+            Style::default().fg(ACTIVE_SORT).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    Cell::from(Line::from(spans))
+}
+
+fn metric_header(
+    name: &str,
+    is_sorted: bool,
+    is_bad: bool,
+    width: usize,
+) -> Cell<'static> {
+    let dot_color = if is_bad { REMOVED } else { ADDED };
+    let name_style = if is_sorted {
+        Style::default()
+            .fg(ACTIVE_SORT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(DIM)
+            .add_modifier(Modifier::BOLD)
+    };
+
+    let content_len = 2 + name.chars().count() + if is_sorted { 2 } else { 0 };
+    let pad = width.saturating_sub(content_len);
+
+    let mut spans = vec![
+        Span::raw(" ".repeat(pad)),
+        Span::styled("\u{2022} ", Style::default().fg(dot_color)),
+        Span::styled(name.to_string(), name_style),
+    ];
+    if is_sorted {
+        spans.push(Span::styled(
+            " \u{25be}",
+            Style::default().fg(ACTIVE_SORT).add_modifier(Modifier::BOLD),
+        ));
+    }
+    Cell::from(Line::from(spans))
+}
+
+fn titled_block(title: &str, title_color: Color) -> Block<'_> {
+    Block::default()
+        .title(Span::styled(
+            title.to_string(),
+            Style::default().fg(title_color).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER_TEAL))
+}
+
+fn gild_header_block() -> Block<'static> {
+    Block::default()
+        .title(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "\u{2726} ",
+                Style::default().fg(GILD_SPARK).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "gild",
+                Style::default().fg(GILD_AMBER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " \u{2726} ",
+                Style::default().fg(GILD_SPARK).add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .borders(Borders::ALL)
+        .border_set(border::DOUBLE)
+        .border_style(Style::default().fg(GILD_AMBER).add_modifier(Modifier::BOLD))
+}
+
+fn is_horizontal_border(sym: &str) -> bool {
+    matches!(sym, "\u{2500}" | "\u{2550}" | "\u{2501}")
+}
+
+fn place_sparkle(buf: &mut Buffer, x: u16, y: u16) {
+    if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+        if is_horizontal_border(cell.symbol()) {
+            cell.set_symbol("\u{2726}");
+            cell.set_fg(GILD_SPARK);
+            cell.modifier |= Modifier::BOLD;
+        }
+    }
+}
+
+/// Scatters ✦ sparkles across the top and bottom borders of the gild frame,
+/// turning the plain `═` line into a proper gilded edge.
+fn sparkle_top_border(frame: &mut ratatui::Frame, area: Rect) {
+    if area.height < 2 || area.width < 24 {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    let top_y = area.y;
+    let bottom_y = area.y + area.height - 1;
+    let w = area.width;
+
+    // Top: 4 sparkles, clustered to the right of the title
+    let top = [
+        area.x + w / 3,
+        area.x + w / 2 + 2,
+        area.x + (w * 2) / 3,
+        area.x + (w * 5) / 6,
+    ];
+    for &x in &top {
+        place_sparkle(buf, x, top_y);
+    }
+
+    // Bottom: 3 sparkles, evenly distributed for balance
+    let bottom = [
+        area.x + w / 5,
+        area.x + w / 2,
+        area.x + (w * 4) / 5,
+    ];
+    for &x in &bottom {
+        place_sparkle(buf, x, bottom_y);
+    }
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enter() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
+
 pub fn run(app: &mut App) -> Result<()> {
-    crossterm::terminal::enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen)?;
-    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let _guard = RawModeGuard::enter()?;
+    let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-
-    let result = event_loop(&mut terminal, app);
-
-    crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-
-    result
+    event_loop(&mut terminal, app)
 }
 
 fn event_loop(
@@ -91,101 +341,193 @@ fn draw(frame: &mut ratatui::Frame, app: &App, table_state: &mut TableState) {
             draw_help(frame, app, chunks[2]);
         }
     }
+
+    if app.theme == Theme::Readable {
+        force_dark_bg(frame);
+    }
+
+    if app.show_theme_picker {
+        draw_theme_picker(frame, app);
+    }
+}
+
+const FORCED_BG: Color = Color::Rgb(0x28, 0x2a, 0x36);
+
+fn force_dark_bg(frame: &mut ratatui::Frame) {
+    let area = frame.area();
+    let buf = frame.buffer_mut();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                if cell.bg == Color::Reset {
+                    cell.bg = FORCED_BG;
+                }
+            }
+        }
+    }
+}
+
+fn draw_theme_picker(frame: &mut ratatui::Frame, app: &App) {
+    let screen = frame.area();
+    let popup_w = 56u16.min(screen.width.saturating_sub(2));
+    let popup_h = 10u16.min(screen.height.saturating_sub(2));
+    if popup_w < 30 || popup_h < 8 {
+        return;
+    }
+    let x = screen.x + (screen.width - popup_w) / 2;
+    let y = screen.y + (screen.height - popup_h) / 3;
+    let popup = Rect::new(x, y, popup_w, popup_h);
+
+    frame.render_widget(Clear, popup);
+
+    let popup_bg = Color::Rgb(0x1e, 0x1f, 0x2e);
+    let highlight = Style::default()
+        .fg(ACTIVE_SORT)
+        .add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(DIM);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Theme ",
+            Style::default().fg(BAR_FULL).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER_TEAL))
+        .style(Style::default().bg(popup_bg));
+
+    let normal_label = if app.theme == Theme::Normal {
+        "[N] Normal  \u{2713}"
+    } else {
+        "[N] Normal"
+    };
+    let readable_label = if app.theme == Theme::Readable {
+        "[R] Readable  \u{2713}"
+    } else {
+        "[R] Readable"
+    };
+
+    let hint = match app.theme {
+        Theme::Normal => "  uses your terminal's background",
+        Theme::Readable => "  forces a dark background for color accuracy",
+    };
+
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Does gild look right in your terminal?",
+            muted,
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled(
+                normal_label,
+                if app.theme == Theme::Normal { highlight } else { muted },
+            ),
+            Span::raw("      "),
+            Span::styled(
+                readable_label,
+                if app.theme == Theme::Readable { highlight } else { muted },
+            ),
+        ]),
+        Line::from(Span::styled(hint, muted)),
+        Line::from(Span::styled(
+            "  N / R or \u{2190}\u{2192} to preview, Enter to confirm",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "  Reopen anytime with [T]",
+            muted,
+        )),
+    ];
+
+    let paragraph = Paragraph::new(text).block(block);
+    frame.render_widget(paragraph, popup);
 }
 
 fn draw_header(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .title(Span::styled(
-            " gild ",
-            Style::default()
-                .fg(BAR_FULL)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(DIM));
+    let block = gild_header_block();
 
     let mut line2 = vec![
-        Span::styled(
-            format_number(app.filtered_commits),
-            Style::default().fg(Color::White),
-        ),
-        Span::styled(" commits  ", Style::default().fg(DIM)),
-        Span::styled(
-            format_number(app.authors.len()),
-            Style::default().fg(Color::White),
-        ),
-        Span::styled(" authors", Style::default().fg(DIM)),
+        fg(fmt_num(app.filtered_commits), Color::White),
+        dim(" commits  "),
+        fg(fmt_num(app.authors.len()), Color::White),
+        dim(" authors"),
     ];
 
     if app.time_mode != crate::app::TimeMode::All {
-        line2.push(Span::styled("  \u{25c0} ", Style::default().fg(DIM)));
-        line2.push(Span::styled(
-            app.time_label(),
-            Style::default()
-                .fg(HEADER_COLOR)
-                .add_modifier(Modifier::BOLD),
-        ));
-        line2.push(Span::styled(" \u{25b6}", Style::default().fg(DIM)));
+        line2.push(dim("  \u{25c0} "));
+        line2.push(bold_fg(app.time_label(), HEADER_COLOR));
+        line2.push(dim(" \u{25b6}"));
     } else {
-        let first_ts = app.sorted_authors().iter().map(|a| a.first_commit).min().unwrap_or(0);
-        let last_ts = app.sorted_authors().iter().map(|a| a.last_commit).max().unwrap_or(0);
-        line2.push(Span::styled("  ", Style::default().fg(DIM)));
-        line2.push(Span::styled(format_date(first_ts), Style::default().fg(Color::White)));
-        line2.push(Span::styled(" \u{2192} ", Style::default().fg(DIM)));
-        line2.push(Span::styled(format_date(last_ts), Style::default().fg(Color::White)));
+        let (first_ts, last_ts) = app.overall_time_range();
+        line2.push(dim("  "));
+        line2.push(fg(fmt_date(first_ts, "%b %Y"), Color::White));
+        line2.push(dim(" \u{2192} "));
+        line2.push(fg(fmt_date(last_ts, "%b %Y"), Color::White));
     }
 
     let text = vec![
         Line::from(vec![
-            Span::styled(
-                &app.repo_info.name,
-                Style::default()
-                    .fg(HEADER_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" on ", Style::default().fg(DIM)),
-            Span::styled(
-                &app.repo_info.branch,
-                Style::default()
-                    .fg(ACTIVE_SORT)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            bold_fg(app.repo_info.name.clone(), HEADER_COLOR),
+            dim(" on "),
+            bold_fg(app.repo_info.branch.clone(), ACTIVE_SORT),
         ]),
         Line::from(line2),
     ];
 
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, area);
+    sparkle_top_border(frame, area);
 }
 
 fn draw_table(frame: &mut ratatui::Frame, app: &App, table_state: &mut TableState, area: Rect) {
-    let sorted = app.sorted_authors();
-    let max_value = sorted
-        .first()
-        .map(|a| app.sort_value(a).max(1))
-        .unwrap_or(1) as f64;
+    const W_COMMITS: usize = 11;
+    const W_LINES: usize = 11;
+    const W_FILES: usize = 10;
+    const W_IMPACT: usize = 10;
+    const W_NOISE: usize = 10;
+    const W_OWN: usize = 9;
 
+    let sort = app.sort_mode;
     let mut header_cells = vec![
         Cell::from(" # "),
         Cell::from("Author"),
-        Cell::from("Commits"),
-        Cell::from("  +Lines"),
-        Cell::from("  -Lines"),
-        Cell::from(" Files"),
-        Cell::from("Impact"),
+        impact_header(sort == SortMode::Impact, W_IMPACT),
+        metric_header("Commits", sort == SortMode::Commits, false, W_COMMITS),
+        metric_header("+Lines", sort == SortMode::LinesAdded, false, W_LINES),
+        metric_header("-Lines", sort == SortMode::LinesRemoved, false, W_LINES),
+        metric_header("Files", sort == SortMode::FilesChanged, false, W_FILES),
+        metric_header("Noise%", sort == SortMode::Noise, true, W_NOISE),
     ];
     if app.has_ownership {
-        header_cells.push(Cell::from("  Own%"));
+        header_cells.push(metric_header(
+            "Own%",
+            sort == SortMode::Ownership,
+            false,
+            W_OWN,
+        ));
     }
-    header_cells.push(Cell::from("Share"));
+    let header = Row::new(header_cells);
 
-    let header = Row::new(header_cells).style(
-        Style::default()
-            .fg(DIM)
-            .add_modifier(Modifier::BOLD),
-    );
+    let authors: Vec<&crate::app::AuthorStats> = app.sorted_authors().collect();
 
-    let rows: Vec<Row> = sorted
+    let range = |f: fn(&crate::app::AuthorStats) -> f64| -> (f64, f64) {
+        authors.iter().fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(lo, hi), a| {
+                let v = f(a);
+                (lo.min(v), hi.max(v))
+            },
+        )
+    };
+    let r_commits = range(|a| a.commits as f64);
+    let r_added = range(|a| a.lines_added as f64);
+    let r_removed = range(|a| a.lines_removed as f64);
+    let r_files = range(|a| a.files_changed as f64);
+    let r_impact = range(|a| a.impact);
+
+    let rows: Vec<Row> = authors
         .iter()
         .enumerate()
         .map(|(i, author)| {
@@ -197,52 +539,48 @@ fn draw_table(frame: &mut ratatui::Frame, app: &App, table_state: &mut TableStat
                 _ => Color::White,
             };
 
-            let value = app.sort_value(author) as f64;
-            let pct = (value / max_value * 100.0).max(0.0);
-            let bar_filled = ((pct / 100.0) * 10.0).round() as usize;
-            let bar_empty = 10usize.saturating_sub(bar_filled);
+            let f_commits = dim_factor(author.commits as f64, r_commits.0, r_commits.1);
+            let f_added = dim_factor(author.lines_added as f64, r_added.0, r_added.1);
+            let f_removed = dim_factor(author.lines_removed as f64, r_removed.0, r_removed.1);
+            let f_files = dim_factor(author.files_changed as f64, r_files.0, r_files.1);
 
-            let net = author.lines_added as i64 - author.lines_removed as i64;
-            let net_color = if net >= 0 { ADDED } else { REMOVED };
+            let impact_t = if r_impact.1 > r_impact.0 {
+                ((author.impact - r_impact.0) / (r_impact.1 - r_impact.0)).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let impact_color = gradient_color(&SPARKLE_STOPS, impact_t);
 
             let mut cells = vec![
                 Cell::from(format!("{:>2} ", rank))
                     .style(Style::default().fg(rank_color).add_modifier(Modifier::BOLD)),
                 Cell::from(truncate(&author.display_name, 24))
                     .style(Style::default().fg(rank_color)),
-                Cell::from(format!("{:>7}", format_number(author.commits)))
-                    .style(Style::default().fg(Color::White)),
-                Cell::from(format!("{:>8}", format_number(author.lines_added)))
-                    .style(Style::default().fg(ADDED)),
-                Cell::from(format!("{:>8}", format_number(author.lines_removed)))
-                    .style(Style::default().fg(REMOVED)),
-                Cell::from(format!("{:>6}", format_number(author.files_changed)))
-                    .style(Style::default().fg(Color::White)),
-                Cell::from(format!("{:>7}", format_impact(author.impact)))
-                    .style(Style::default().fg(HEADER_COLOR)),
+                Cell::from(format!("{:>width$}", format_impact(author.impact), width = W_IMPACT))
+                    .style(Style::default().fg(impact_color).add_modifier(Modifier::BOLD)),
+                Cell::from(format!("{:>width$}", fmt_num(author.commits), width = W_COMMITS))
+                    .style(Style::default().fg(scale_color(Color::White, f_commits))),
+                Cell::from(format!("{:>width$}", fmt_num(author.lines_added), width = W_LINES))
+                    .style(Style::default().fg(scale_color(ADDED, f_added))),
+                Cell::from(format!("{:>width$}", fmt_num(author.lines_removed), width = W_LINES))
+                    .style(Style::default().fg(scale_color(REMOVED, f_removed))),
+                Cell::from(format!("{:>width$}", fmt_num(author.files_changed), width = W_FILES))
+                    .style(Style::default().fg(scale_color(Color::White, f_files))),
             ];
 
+            let noise = crate::app::noise_pct(author);
+            cells.push(
+                Cell::from(format!("{:>width$.1}", noise, width = W_NOISE))
+                    .style(Style::default().fg(gradient_color(&NOISE_STOPS, noise / 100.0))),
+            );
+
             if app.has_ownership {
+                let t = (author.ownership_pct / 100.0).clamp(0.0, 1.0);
                 cells.push(
-                    Cell::from(format!("{:>5.1}", author.ownership_pct))
-                        .style(Style::default().fg(Color::Rgb(255, 184, 108))),
+                    Cell::from(format!("{:>width$.1}", author.ownership_pct, width = W_OWN))
+                        .style(Style::default().fg(gradient_color(&OWNERSHIP_STOPS, t))),
                 );
             }
-
-            cells.push(Cell::from(Line::from(vec![
-                Span::styled(
-                    "\u{2588}".repeat(bar_filled),
-                    Style::default().fg(BAR_FULL),
-                ),
-                Span::styled(
-                    "\u{2591}".repeat(bar_empty),
-                    Style::default().fg(BAR_EMPTY),
-                ),
-                Span::styled(
-                    format!(" {:>3.0}%", pct),
-                    Style::default().fg(net_color),
-                ),
-            ])));
 
             Row::new(cells)
         })
@@ -251,22 +589,22 @@ fn draw_table(frame: &mut ratatui::Frame, app: &App, table_state: &mut TableStat
     let mut widths = vec![
         Constraint::Length(4),
         Constraint::Length(25),
-        Constraint::Length(8),
-        Constraint::Length(9),
-        Constraint::Length(9),
-        Constraint::Length(7),
-        Constraint::Length(8),
+        Constraint::Length(W_IMPACT as u16),
+        Constraint::Length(W_COMMITS as u16),
+        Constraint::Length(W_LINES as u16),
+        Constraint::Length(W_LINES as u16),
+        Constraint::Length(W_FILES as u16),
+        Constraint::Length(W_NOISE as u16),
     ];
     if app.has_ownership {
-        widths.push(Constraint::Length(6));
+        widths.push(Constraint::Length(W_OWN as u16));
     }
-    widths.push(Constraint::Min(16));
 
     let table = Table::new(rows, widths)
         .header(header)
         .row_highlight_style(
             Style::default()
-                .bg(Color::Rgb(40, 42, 54))
+                .bg(Color::Rgb(0x44, 0x48, 0x5c))
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -276,9 +614,10 @@ fn draw_table(frame: &mut ratatui::Frame, app: &App, table_state: &mut TableStat
 fn draw_graph(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let graph = app.graph_data();
     if graph.rows.is_empty() {
-        let msg = Paragraph::new("  No data for this period.")
-            .style(Style::default().fg(DIM));
-        frame.render_widget(msg, area);
+        frame.render_widget(
+            Paragraph::new("  No data for this period.").style(Style::default().fg(DIM)),
+            area,
+        );
         return;
     }
 
@@ -307,9 +646,9 @@ fn draw_graph(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         let last = graph.labels.last().unwrap();
         let pad = spark_width.saturating_sub(first.len() + last.len());
         lines.push(Line::from(vec![
-            Span::styled(format!(" {:>width$}", "", width = name_col - 1), Style::default()),
-            Span::styled(first.clone(), Style::default().fg(DIM)),
-            Span::styled(format!("{:>width$}", last, width = pad + last.len()), Style::default().fg(DIM)),
+            Span::raw(format!(" {:>width$}", "", width = name_col - 1)),
+            dim(first.clone()),
+            dim(format!("{:>width$}", last, width = pad + last.len())),
         ]));
     }
 
@@ -327,15 +666,9 @@ fn draw_graph(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         let name_pad = (name_col - 1).saturating_sub(display_width(&name_display));
 
         let spans = vec![
-            Span::styled(
-                format!(" {}{}", name_display, " ".repeat(name_pad)),
-                Style::default().fg(row.color),
-            ),
-            Span::styled(spark_str, Style::default().fg(row.color)),
-            Span::styled(
-                format!(" {:>7}", format_number(total as usize)),
-                Style::default().fg(DIM),
-            ),
+            fg(format!(" {}{}", name_display, " ".repeat(name_pad)), row.color),
+            fg(spark_str, row.color),
+            dim(format!(" {:>7}", fmt_num(total as usize))),
         ];
         lines.push(Line::from(spans));
     }
@@ -353,7 +686,7 @@ fn draw_detail_view(frame: &mut ratatui::Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Min(10),
             Constraint::Length(1),
         ])
@@ -363,73 +696,146 @@ fn draw_detail_view(frame: &mut ratatui::Frame, app: &App) {
     let ownership_line = if a.ownership_lines > 0 {
         format!(
             "  Owns {} lines ({:.1}% of codebase)",
-            format_number(a.ownership_lines),
+            fmt_num(a.ownership_lines),
             a.ownership_pct
         )
     } else {
         String::new()
     };
 
-    let header_block = Block::default()
-        .title(Span::styled(
-            " gild ",
-            Style::default().fg(BAR_FULL).add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(DIM));
+    let ct = &a.change_types;
+    let ct_total = ct.feature + ct.refactor + ct.trivial;
+    let ws_pct = if a.lines_added + a.lines_removed > 0 {
+        ct.whitespace_lines as f64 / (a.lines_added + a.lines_removed) as f64 * 100.0
+    } else {
+        0.0
+    };
 
-    let header_text = vec![
-        Line::from(vec![
-            Span::styled(
-                &a.display_name,
-                Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(format_number(a.commits), Style::default().fg(Color::White)),
-            Span::styled(" commits  ", Style::default().fg(DIM)),
-            Span::styled(format!("+{}", format_number(a.lines_added)), Style::default().fg(ADDED)),
-            Span::styled("  ", Style::default().fg(DIM)),
-            Span::styled(format!("-{}", format_number(a.lines_removed)), Style::default().fg(REMOVED)),
-            Span::styled("  ", Style::default().fg(DIM)),
-            Span::styled(format!("{} files", format_number(a.files_changed)), Style::default().fg(Color::White)),
-            Span::styled("  impact ", Style::default().fg(DIM)),
-            Span::styled(format_impact(a.impact), Style::default().fg(HEADER_COLOR)),
-            Span::styled(&ownership_line, Style::default().fg(Color::Rgb(255, 184, 108))),
-        ]),
-    ];
+    let header_block = gild_header_block();
 
-    let header = Paragraph::new(header_text).block(header_block);
-    frame.render_widget(header, chunks[0]);
+    let name_line = Line::from(vec![
+        bold_fg(a.display_name.clone(), GOLD),
+        Span::raw("  "),
+        dim(app.time_label()),
+    ]);
+
+    let stats_line = if a.commits == 0 {
+        Line::from(vec![Span::styled(
+            format!("No activity in {}", app.time_label()),
+            Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+        )])
+    } else {
+        Line::from(vec![
+            fg(fmt_num(a.commits), Color::White),
+            dim(" commits  "),
+            fg(format!("+{}", fmt_num(a.lines_added)), ADDED),
+            dim("  "),
+            fg(format!("-{}", fmt_num(a.lines_removed)), REMOVED),
+            dim("  "),
+            fg(format!("{} files", fmt_num(a.files_changed)), Color::White),
+            fg(format!(" (+{}", fmt_num(ct.new_files)), ADDED),
+            fg(format!(" -{}", fmt_num(ct.deleted_files)), REMOVED),
+            dim(")  "),
+            dim("impact "),
+            fg(format_impact(a.impact), HEADER_COLOR),
+            fg(ownership_line.clone(), Color::Rgb(255, 184, 108)),
+        ])
+    };
+
+    let mut header_text = vec![name_line, stats_line];
+    if ct_total > 0 {
+        let mut spans = vec![
+            fg(format!("{} feature", ct.feature), ADDED),
+            dim("  "),
+            fg(format!("{} refactor", ct.refactor), Color::Rgb(139, 233, 253)),
+            dim("  "),
+            dim(format!("{} trivial", ct.trivial)),
+        ];
+        if ct.new_files > 0 {
+            spans.push(fg(format!("  +{} new files", ct.new_files), ADDED));
+        }
+        if ct.deleted_files > 0 {
+            spans.push(fg(format!("  -{} deleted", ct.deleted_files), REMOVED));
+        }
+        if ws_pct > 1.0 {
+            spans.push(fg(format!("  {:.0}% whitespace", ws_pct), Color::Rgb(255, 85, 85)));
+        }
+        header_text.push(Line::from(spans));
+    }
+
+    let header_inner = header_block.inner(chunks[0]);
+    frame.render_widget(header_block, chunks[0]);
+    sparkle_top_border(frame, chunks[0]);
+
+    let spindle_width: u16 = 24;
+    let (body_area, spindle_area) = if header_inner.width > spindle_width + 20 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(20),
+                Constraint::Length(spindle_width),
+            ])
+            .split(header_inner);
+        (cols[0], Some(cols[1]))
+    } else {
+        (header_inner, None)
+    };
+
+    frame.render_widget(Paragraph::new(header_text), body_area);
+
+    if let Some(area) = spindle_area {
+        let max_name = (spindle_width as usize).saturating_sub(4);
+        let neighbor_line = |arrow: &'static str, name: &Option<String>| match name {
+            Some(n) => Line::from(vec![fg(arrow, ACTIVE_SORT), fg(truncate(n, max_name), Color::White)]),
+            None => Line::from(dim(format!("{}\u{2014}", arrow))),
+        };
+        let spindle_text = vec![
+            neighbor_line("\u{25b2} ", &detail.prev_name),
+            neighbor_line("\u{25bc} ", &detail.next_name),
+        ];
+        frame.render_widget(Paragraph::new(spindle_text), area);
+    }
 
     let content_area = chunks[1];
-    let content_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+    let content_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(content_area);
 
-    draw_detail_files(frame, &detail.top_files, app.detail_scroll, content_chunks[0]);
-    draw_detail_activity(frame, &detail.activity, content_chunks[1]);
+    let top_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(content_rows[0]);
+
+    let bottom_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(content_rows[1]);
+
+    draw_detail_files(frame, &detail.top_files, app.detail_scroll, top_cols[0]);
+    draw_detail_activity(frame, &detail.activity, top_cols[1]);
+    draw_file_events(frame, &detail.recent_added, " New files ", ADDED, bottom_cols[0]);
+    draw_file_events(frame, &detail.recent_deleted, " Deleted files ", REMOVED, bottom_cols[1]);
 
     let help = Paragraph::new(Line::from(vec![
-        Span::styled("[Esc]", Style::default().fg(DIM)),
-        Span::styled("back ", Style::default().fg(DIM)),
-        Span::styled("[↑↓]", Style::default().fg(DIM)),
-        Span::styled("scroll ", Style::default().fg(DIM)),
-        Span::styled("[q]", Style::default().fg(DIM)),
-        Span::styled("uit", Style::default().fg(DIM)),
+        dim("[Esc]"),
+        dim("back "),
+        dim("[t]"),
+        dim("ime "),
+        dim("[←→]"),
+        dim("period "),
+        dim("[↑↓]"),
+        dim("author "),
+        dim("[PgUp/Dn]"),
+        dim("scroll "),
+        dim("[q]"),
+        dim("uit"),
     ]));
     frame.render_widget(help, chunks[2]);
 }
 
 fn draw_detail_files(frame: &mut ratatui::Frame, files: &[(String, usize)], scroll: usize, area: Rect) {
-    let block = Block::default()
-        .title(Span::styled(
-            " Top Files ",
-            Style::default().fg(HEADER_COLOR).add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(DIM));
+    let block = titled_block(" Top Files ", HEADER_COLOR);
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -450,25 +856,24 @@ fn draw_detail_files(frame: &mut ratatui::Frame, files: &[(String, usize)], scro
         .skip(start)
         .take(visible_height)
         .map(|(path, count)| {
-            let bar_width: usize = 6;
+            let bar_width: usize = 10;
             let filled = (*count as f64 / max_count as f64 * bar_width as f64).round() as usize;
-            let bar: String = "\u{2588}".repeat(filled)
-                + &"\u{2591}".repeat(bar_width.saturating_sub(filled));
 
             let max_path_len = (inner.width as usize).saturating_sub(bar_width + 8);
             let display_path = truncate_left(path, max_path_len);
 
-            Line::from(vec![
-                Span::styled(
-                    format!(" {:>4} ", count),
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(bar, Style::default().fg(BAR_FULL)),
-                Span::styled(
-                    format!(" {}", display_path),
-                    Style::default().fg(HEADER_COLOR),
-                ),
-            ])
+            let mut spans = vec![fg(format!(" {:>4} ", count), Color::White)];
+            let denom = (bar_width.saturating_sub(1)).max(1) as f64;
+            for i in 0..bar_width {
+                if i < filled {
+                    let t = i as f64 / denom;
+                    spans.push(fg("\u{2588}", gradient_color(&HEAT_STOPS, t)));
+                } else {
+                    spans.push(fg("\u{2591}", DIM));
+                }
+            }
+            spans.push(fg(format!(" {}", display_path), HEADER_COLOR));
+            Line::from(spans)
         })
         .collect();
 
@@ -477,13 +882,7 @@ fn draw_detail_files(frame: &mut ratatui::Frame, files: &[(String, usize)], scro
 }
 
 fn draw_detail_activity(frame: &mut ratatui::Frame, activity: &[[usize; 24]; 7], area: Rect) {
-    let block = Block::default()
-        .title(Span::styled(
-            " Activity Pattern ",
-            Style::default().fg(HEADER_COLOR).add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(DIM));
+    let block = titled_block(" Activity Pattern ", HEADER_COLOR);
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -506,39 +905,41 @@ fn draw_detail_activity(frame: &mut ratatui::Frame, activity: &[[usize; 24]; 7],
     let mut lines: Vec<Line> = Vec::new();
 
     let hour_labels: Vec<String> = (0..24).step_by(3).map(|h| format!("{:>2}", h)).collect();
-    let mut header_spans = vec![Span::styled("      ", Style::default())];
+    let mut header_spans = vec![Span::raw("      ")];
     for label in &hour_labels {
-        header_spans.push(Span::styled(
-            format!("{} ", label),
-            Style::default().fg(DIM),
-        ));
+        header_spans.push(dim(format!("{} ", label)));
     }
     lines.push(Line::from(header_spans));
     lines.push(Line::from(""));
 
     for (day_idx, day_name) in days.iter().enumerate() {
-        let mut spans = vec![Span::styled(
-            format!(" {} ", day_name),
-            Style::default().fg(Color::White),
-        )];
-        spans.push(Span::styled("  ", Style::default()));
+        let total: usize = activity[day_idx].iter().sum();
+        let is_weekend = day_idx >= 5;
+        let empty_weekday = total == 0 && !is_weekend;
 
-        for hour in 0..24 {
-            let val = activity[day_idx][hour];
-            let intensity = if max_val > 0 {
-                (val as f64 / max_val as f64 * 4.0).round() as usize
+        let (day_color, marker) = if empty_weekday {
+            (EMPTY_WEEKDAY, "\u{2205} ")
+        } else if is_weekend {
+            (DIM, "  ")
+        } else {
+            (Color::White, "  ")
+        };
+
+        let mut spans = vec![
+            fg(format!(" {} ", day_name), day_color),
+            fg(marker, day_color),
+        ];
+
+        for &val in &activity[day_idx] {
+            let t = if val == 0 {
+                0.0
             } else {
-                0
+                (val as f64 / max_val as f64).powf(0.6)
             };
-            let color = HEAT_COLORS[intensity.min(4)];
-            spans.push(Span::styled("\u{2588}", Style::default().fg(color)));
+            spans.push(fg("\u{2588}", gradient_color(&HEAT_STOPS, t)));
         }
 
-        let total: usize = activity[day_idx].iter().sum();
-        spans.push(Span::styled(
-            format!(" {:>3}", total),
-            Style::default().fg(DIM),
-        ));
+        spans.push(dim(format!(" {:>3}", total)));
 
         lines.push(Line::from(spans));
     }
@@ -546,7 +947,7 @@ fn draw_detail_activity(frame: &mut ratatui::Frame, activity: &[[usize; 24]; 7],
     lines.push(Line::from(""));
 
     let total_all: usize = activity.iter().flat_map(|r| r.iter()).sum();
-    let mut hour_totals = vec![0usize; 24];
+    let mut hour_totals = [0usize; 24];
     for row in activity {
         for (h, &v) in row.iter().enumerate() {
             hour_totals[h] += v;
@@ -560,11 +961,49 @@ fn draw_detail_activity(frame: &mut ratatui::Frame, activity: &[[usize; 24]; 7],
         .unwrap_or(0);
 
     lines.push(Line::from(vec![
-        Span::styled(" Total: ", Style::default().fg(DIM)),
-        Span::styled(format!("{}", total_all), Style::default().fg(Color::White)),
-        Span::styled("  Peak: ", Style::default().fg(DIM)),
-        Span::styled(format!("{}:00", peak_hour), Style::default().fg(ACTIVE_SORT)),
+        dim(" Total: "),
+        fg(total_all.to_string(), Color::White),
+        dim("  Peak: "),
+        fg(format!("{}:00", peak_hour), ACTIVE_SORT),
     ]));
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
+}
+
+fn draw_file_events(
+    frame: &mut ratatui::Frame,
+    events: &[FileEvent],
+    title: &str,
+    color: Color,
+    area: Rect,
+) {
+    let block = titled_block(title, color);
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if events.is_empty() {
+        let msg = Paragraph::new("  None").style(Style::default().fg(DIM));
+        frame.render_widget(msg, inner);
+        return;
+    }
+
+    let lines: Vec<Line> = events
+        .iter()
+        .take(inner.height as usize)
+        .map(|ev| {
+            let date = fmt_date(ev.timestamp, "%m-%d");
+            let path = if ev.path.len() > (inner.width as usize).saturating_sub(12) {
+                let max_w = (inner.width as usize).saturating_sub(12);
+                let start = ev.path.len().saturating_sub(max_w);
+                format!("\u{2026}{}", &ev.path[start..])
+            } else {
+                ev.path.clone()
+            };
+            Line::from(vec![dim(format!(" {} ", date)), fg(path, color)])
+        })
+        .collect();
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
@@ -619,79 +1058,46 @@ fn resample(data: &[u64], target_len: usize) -> Vec<u64> {
 }
 
 fn draw_help(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let spans: Vec<Span> = SortMode::ALL
-        .iter()
-        .flat_map(|&mode| {
-            let is_active = mode == app.sort_mode;
-            let style = if is_active {
-                Style::default()
-                    .fg(ACTIVE_SORT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(DIM)
-            };
-            vec![
-                Span::styled(format!("[{}]", mode.key_hint()), style),
-                Span::styled(format!("{} ", mode.label()), style),
-            ]
-        })
-        .chain(vec![
-            Span::styled(" \u{2502} ", Style::default().fg(DIM)),
-            Span::styled(
-                format!("[t]{}", app.time_mode.label()),
-                if app.time_mode != crate::app::TimeMode::All {
-                    Style::default().fg(HEADER_COLOR).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(DIM)
-                },
-            ),
-            Span::styled(
-                " [\u{2190}\u{2192}]",
-                Style::default().fg(DIM),
-            ),
-            Span::styled(" \u{2502} ", Style::default().fg(DIM)),
-            Span::styled(
-                if app.view_mode == ViewMode::Graph {
-                    "[g]table"
-                } else {
-                    "[g]raph"
-                },
-                if app.view_mode == ViewMode::Graph {
-                    Style::default().fg(HEADER_COLOR).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(DIM)
-                },
-            ),
-            Span::styled(" ", Style::default().fg(DIM)),
-            Span::styled("[↑↓]", Style::default().fg(DIM)),
-            Span::styled("scroll ", Style::default().fg(DIM)),
-            Span::styled("[⏎]", Style::default().fg(DIM)),
-            Span::styled("detail ", Style::default().fg(DIM)),
-            Span::styled("[q]", Style::default().fg(DIM)),
-            Span::styled("uit", Style::default().fg(DIM)),
+    let sort_spans = SortMode::ALL.iter().flat_map(|&mode| {
+        let style = if mode == app.sort_mode {
+            Style::default().fg(ACTIVE_SORT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        };
+        [
+            Span::styled(format!("[{}]", mode.key_hint()), style),
+            Span::styled(format!("{} ", mode.label()), style),
+        ]
+    });
+
+    let time_style = if app.time_mode != crate::app::TimeMode::All {
+        Style::default().fg(HEADER_COLOR).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
+    let (view_label, view_style) = if app.view_mode == ViewMode::Graph {
+        ("[g]table", Style::default().fg(HEADER_COLOR).add_modifier(Modifier::BOLD))
+    } else {
+        ("[g]raph", Style::default().fg(DIM))
+    };
+
+    let spans: Vec<Span> = sort_spans
+        .chain([
+            dim(" \u{2502} "),
+            Span::styled(format!("[t]{}", app.time_mode.label()), time_style),
+            dim(" [\u{2190}\u{2192}]"),
+            dim(" \u{2502} "),
+            Span::styled(view_label, view_style),
+            dim(" [↑↓]"),
+            dim("scroll "),
+            dim("[⏎]"),
+            dim("detail "),
+            dim("[q]"),
+            dim("uit"),
         ])
         .collect();
 
-    let help = Paragraph::new(Line::from(spans));
-    frame.render_widget(help, area);
-}
-
-fn format_number(n: usize) -> String {
-    let s = n.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    result.chars().rev().collect()
-}
-
-fn format_date(timestamp: i64) -> String {
-    DateTime::from_timestamp(timestamp, 0)
-        .map(|dt| dt.format("%b %Y").to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn truncate(s: &str, max_width: usize) -> String {
@@ -714,16 +1120,19 @@ fn truncate_left(s: &str, max_width: usize) -> String {
     if w <= max_width {
         return s.to_string();
     }
-    let mut result = String::from("\u{2026}");
+    let mut chars: Vec<char> = Vec::new();
     let mut current_width = 1;
     for c in s.chars().rev() {
         let cw = char_display_width(c);
         if current_width + cw > max_width {
             break;
         }
-        result.insert(1, c);
+        chars.push(c);
         current_width += cw;
     }
+    chars.reverse();
+    let mut result = String::from("\u{2026}");
+    result.extend(chars);
     result
 }
 
@@ -736,34 +1145,66 @@ fn format_impact(impact: f64) -> String {
 }
 
 pub fn print_table(app: &App) {
-    let sorted = app.sorted_authors();
-    let max_value = sorted
-        .first()
-        .map(|a| app.sort_value(a).max(1))
-        .unwrap_or(1) as f64;
-
     println!(
         "\x1b[1;36m{}\x1b[0m on \x1b[1;32m{}\x1b[0m",
         app.repo_info.name, app.repo_info.branch
     );
     println!(
         "{} commits \u{00b7} {} authors\n",
-        format_number(app.total_commits),
-        format_number(app.total_authors)
+        fmt_num(app.total_commits),
+        fmt_num(app.total_authors)
     );
 
-    let own_header = if app.has_ownership { " Own%" } else { "" };
-    println!(
-        "\x1b[1m{:>3}  {:<24} {:>7} {:>9} {:>9} {:>6} {:>7}{:>6}  {}\x1b[0m",
-        "#", "Author", "Commits", "+Lines", "-Lines", "Files", "Impact", own_header, "Share"
-    );
+    fn hdr(name: &str, sorted: bool, bad: bool, width: usize) -> String {
+        let dot = if bad { "\x1b[31m\u{2022}\x1b[0m" } else { "\x1b[32m\u{2022}\x1b[0m" };
+        let sort_sfx = if sorted { " \x1b[1;36m\u{25be}\x1b[0m" } else { "" };
+        let visible = 2 + name.chars().count() + if sorted { 2 } else { 0 };
+        let pad = width.saturating_sub(visible);
+        format!(
+            "{}{} \x1b[1m{}\x1b[0m{}",
+            " ".repeat(pad),
+            dot,
+            name,
+            sort_sfx
+        )
+    }
 
-    for (i, author) in sorted.iter().enumerate() {
+    fn impact_hdr(sorted: bool, width: usize) -> String {
+        let sort_sfx = if sorted { " \x1b[1;36m\u{25be}\x1b[0m" } else { "" };
+        let visible = 2 + 6 + if sorted { 2 } else { 0 };
+        let pad = width.saturating_sub(visible);
+        format!(
+            "{}\x1b[1;38;2;255;255;255m\u{2726}\x1b[0m \x1b[1;38;2;137;221;255mImpact\x1b[0m{}",
+            " ".repeat(pad),
+            sort_sfx
+        )
+    }
+
+    let sort = app.sort_mode;
+    let mut header_line = format!(
+        "\x1b[1m{:>3}  {:<24}\x1b[0m",
+        "#", "Author"
+    );
+    header_line.push(' ');
+    header_line.push_str(&impact_hdr(sort == SortMode::Impact, 10));
+    header_line.push(' ');
+    header_line.push_str(&hdr("Commits", sort == SortMode::Commits, false, 11));
+    header_line.push(' ');
+    header_line.push_str(&hdr("+Lines", sort == SortMode::LinesAdded, false, 10));
+    header_line.push(' ');
+    header_line.push_str(&hdr("-Lines", sort == SortMode::LinesRemoved, false, 10));
+    header_line.push(' ');
+    header_line.push_str(&hdr("Files", sort == SortMode::FilesChanged, false, 9));
+    header_line.push(' ');
+    header_line.push_str(&hdr("Noise%", sort == SortMode::Noise, true, 10));
+    if app.has_ownership {
+        header_line.push(' ');
+        header_line.push_str(&hdr("Own%", sort == SortMode::Ownership, false, 8));
+    }
+    println!("{}", header_line);
+
+    for (i, author) in app.sorted_authors().enumerate() {
         let rank = i + 1;
-        let value = app.sort_value(author) as f64;
-        let pct = (value / max_value * 100.0).max(0.0);
-        let filled = ((pct / 100.0) * 10.0).round() as usize;
-        let empty = 10usize.saturating_sub(filled);
 
         let rank_color = match rank {
             1 => "\x1b[1;33m",
@@ -772,27 +1213,35 @@ pub fn print_table(app: &App) {
             _ => "\x1b[0m",
         };
 
+        let noise = crate::app::noise_pct(author);
+        let noise_color = if noise >= 60.0 {
+            "\x1b[31m"
+        } else if noise >= 30.0 {
+            "\x1b[33m"
+        } else {
+            "\x1b[32m"
+        };
+
         let own_col = if app.has_ownership {
-            format!(" \x1b[33m{:>5.1}\x1b[0m", author.ownership_pct)
+            format!(" \x1b[33m{:>8.1}\x1b[0m", author.ownership_pct)
         } else {
             String::new()
         };
 
         println!(
-            "{}{:>3}\x1b[0m  {}{:<24}\x1b[0m {:>7} \x1b[32m{:>9}\x1b[0m \x1b[31m{:>9}\x1b[0m {:>6} \x1b[36m{:>7}\x1b[0m{}  \x1b[35m{}\x1b[90m{}\x1b[0m {:>3.0}%",
+            "{}{:>3}\x1b[0m  {}{:<24}\x1b[0m \x1b[1;38;2;184;228;255m{:>10}\x1b[0m {:>11} \x1b[32m{:>10}\x1b[0m \x1b[31m{:>10}\x1b[0m {:>9} {}{:>10.1}\x1b[0m{}",
             rank_color,
             rank,
             rank_color,
             truncate(&author.display_name, 24),
-            format_number(author.commits),
-            format_number(author.lines_added),
-            format_number(author.lines_removed),
-            format_number(author.files_changed),
             format_impact(author.impact),
+            fmt_num(author.commits),
+            fmt_num(author.lines_added),
+            fmt_num(author.lines_removed),
+            fmt_num(author.files_changed),
+            noise_color,
+            noise,
             own_col,
-            "\u{2588}".repeat(filled),
-            "\u{2591}".repeat(empty),
-            pct,
         );
     }
 }

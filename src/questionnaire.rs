@@ -157,7 +157,7 @@ fn similarity_score(a: &IdentityGroup, b: &IdentityGroup) -> Option<usize> {
                 }
 
                 let lev = strsim::levenshtein(&norm_a, &norm_b);
-                let max_len = norm_a.len().max(norm_b.len());
+                let max_len = norm_a.chars().count().max(norm_b.chars().count());
                 if max_len > 0 && lev <= max_len / 3 && lev <= 5 {
                     let score = if domain_a == domain_b { 70 } else { 50 };
                     best = best.max(score);

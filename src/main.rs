@@ -5,6 +5,7 @@ use std::path::PathBuf;
 mod app;
 mod cache;
 mod export;
+mod fmt;
 mod git;
 mod identity;
 mod identity_map;
@@ -12,6 +13,7 @@ mod mailmap;
 mod ownership;
 mod questionnaire;
 mod ui;
+mod util;
 
 #[derive(Parser)]
 #[command(name = "gild", about = "Interactive git contribution analyzer")]
@@ -53,6 +55,10 @@ struct Cli {
     force_questions: bool,
 }
 
+fn clear_progress() {
+    eprint!("\r\x1b[2K");
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -63,20 +69,28 @@ fn main() -> Result<()> {
 
     let mut commit_cache = cache::Cache::load(&path.join(".git"));
 
-    let (info, commits) = git::load_commits(
+    let (info, repo, mut commits) = git::load_commits(
         &path,
         cli.branch.as_deref(),
         cli.max_commits,
         &mut commit_cache,
         |total, new| {
-            if new > 0 {
-                eprint!("\r  Scanning... {} commits ({} new)", total, new);
-            } else {
-                eprint!("\r  Loading... {} commits (cached)", total);
+            let step = match total {
+                0..=99 => 1,
+                100..=999 => 10,
+                1000..=9999 => 100,
+                _ => 1000,
+            };
+            if total % step == 0 {
+                if new > 0 {
+                    eprint!("\r  Scanning... {} commits ({} new)", total, new);
+                } else {
+                    eprint!("\r  Loading... {} commits (cached)", total);
+                }
             }
         },
     )?;
-    eprint!("\r\x1b[2K");
+    clear_progress();
 
     if commits.is_empty() {
         eprintln!("No commits found.");
@@ -96,11 +110,11 @@ fn main() -> Result<()> {
     let map_path = cache::identities_path(&info.git_dir);
     let mut identity_map = identity_map::IdentityMap::load(&map_path);
 
-    let (preliminary_groups, _, _) = identity::merge(&commits, &identity_map, &mailmap_entries);
+    let initial_merge = identity::merge(&commits, &identity_map, &mailmap_entries);
 
-    if !cli.no_questions {
+    let identity_changed = if !cli.no_questions {
         let changed = questionnaire::run(
-            &preliminary_groups,
+            &initial_merge.0,
             &mut identity_map,
             &map_path,
             cli.force_questions,
@@ -111,42 +125,36 @@ fn main() -> Result<()> {
                 map_path.display()
             );
         }
+        changed
+    } else {
+        false
+    };
+
+    let (groups, assignments) = if identity_changed {
+        identity::merge(&commits, &identity_map, &mailmap_entries)
+    } else {
+        initial_merge
+    };
+    for (commit, &gid) in commits.iter_mut().zip(assignments.iter()) {
+        commit.group_id = gid;
     }
 
-    let (groups, assignments, _pair_to_group) =
-        identity::merge(&commits, &identity_map, &mailmap_entries);
-
-    let commit_entries: Vec<app::CommitEntry> = commits
-        .iter()
-        .enumerate()
-        .map(|(i, c)| app::CommitEntry {
-            group_id: assignments[i],
-            lines_added: c.lines_added,
-            lines_removed: c.lines_removed,
-            files_changed: c.files_changed,
-            timestamp: c.timestamp,
-            files: c.files.clone(),
-        })
-        .collect();
-
     let num_groups = groups.len();
-    let mut app = app::App::new(commit_entries, groups, info);
+    let git_dir = info.git_dir.clone();
+    let mut app = app::App::new(commits, groups, info);
 
     if !cli.no_ownership {
-        let repo = git2::Repository::open(&path)?;
-        let git_dir = repo.path().to_path_buf();
-        let commit_entries_ref = app.commit_entries();
-        match ownership::compute(&repo, &git_dir, commit_entries_ref, |done, total| {
+        match ownership::compute(&repo, &git_dir, app.commits(), |done, total| {
             eprint!("\r  Ownership... {}/{} files", done, total);
         }) {
             Ok(data) => {
-                eprint!("\r\x1b[2K");
+                clear_progress();
                 let (per_group, mapped_total) =
                     ownership::map_to_groups(&data, num_groups);
                 app.set_ownership(per_group, mapped_total);
             }
             Err(e) => {
-                eprint!("\r\x1b[2K");
+                clear_progress();
                 eprintln!("  Ownership: skipped ({})", e);
             }
         }

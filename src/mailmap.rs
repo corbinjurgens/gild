@@ -1,4 +1,5 @@
-use std::fs;
+use crate::util::load_or_default;
+use std::convert::Infallible;
 use std::path::Path;
 
 pub struct MailmapEntry {
@@ -9,14 +10,9 @@ pub struct MailmapEntry {
 }
 
 pub fn load(repo_path: &Path) -> Vec<MailmapEntry> {
-    let mailmap_path = repo_path.join(".mailmap");
-    if !mailmap_path.exists() {
-        return Vec::new();
-    }
-    match fs::read_to_string(&mailmap_path) {
-        Ok(s) => parse(&s),
-        Err(_) => Vec::new(),
-    }
+    load_or_default(&repo_path.join(".mailmap"), |s| {
+        Ok::<_, Infallible>(parse(s))
+    })
 }
 
 fn parse(content: &str) -> Vec<MailmapEntry> {

@@ -1,4 +1,4 @@
-use crate::git::RawCommit;
+use crate::git::Commit;
 use crate::identity_map::{parse_identity, IdentityMap};
 use crate::mailmap::MailmapEntry;
 use std::collections::HashMap;
@@ -8,25 +8,25 @@ pub struct IdentityGroup {
     pub aliases: Vec<(String, String)>,
 }
 
-pub fn merge(
-    commits: &[RawCommit],
+pub fn merge<'a>(
+    commits: &'a [Commit],
     identity_map: &IdentityMap,
     mailmap: &[MailmapEntry],
-) -> (Vec<IdentityGroup>, Vec<usize>, HashMap<(String, String), usize>) {
-    let mut pair_counts: HashMap<(String, String), usize> = HashMap::new();
+) -> (Vec<IdentityGroup>, Vec<usize>) {
+    let mut pair_counts: HashMap<(&'a str, &'a str), usize> = HashMap::new();
     for c in commits {
         *pair_counts
-            .entry((c.author_name.clone(), c.author_email.clone()))
+            .entry((c.author_name.as_str(), c.author_email.as_str()))
             .or_insert(0) += 1;
     }
 
-    let pairs: Vec<(String, String)> = pair_counts.keys().cloned().collect();
+    let pairs: Vec<(&'a str, &'a str)> = pair_counts.keys().copied().collect();
     let n = pairs.len();
 
-    let pair_index: HashMap<(String, String), usize> = pairs
+    let pair_index: HashMap<(&str, &str), usize> = pairs
         .iter()
         .enumerate()
-        .map(|(i, p)| (p.clone(), i))
+        .map(|(i, &p)| (p, i))
         .collect();
 
     let mut parent: Vec<usize> = (0..n).collect();
@@ -37,11 +37,9 @@ pub fn merge(
             .members
             .iter()
             .filter_map(|m| parse_identity(m))
-            .filter_map(|p| pair_index.get(&p).copied())
+            .filter_map(|(n, e)| pair_index.get(&(n.as_str(), e.as_str())).copied())
             .collect();
-        for w in indices.windows(2) {
-            union(&mut parent, &mut rank, w[0], w[1]);
-        }
+        union_all(&mut parent, &mut rank, &indices);
     }
 
     let mailmap_names = apply_mailmap(&pairs, mailmap, &mut parent, &mut rank);
@@ -54,9 +52,7 @@ pub fn merge(
         }
     }
     for indices in email_buckets.values() {
-        for w in indices.windows(2) {
-            union(&mut parent, &mut rank, w[0], w[1]);
-        }
+        union_all(&mut parent, &mut rank, indices);
     }
 
     let mut group_members: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -68,7 +64,7 @@ pub fn merge(
     }
 
     let mut groups: Vec<IdentityGroup> = Vec::new();
-    let mut pair_to_group: HashMap<(String, String), usize> = HashMap::new();
+    let mut pair_to_group: Vec<usize> = vec![usize::MAX; n];
 
     for members in group_members.values() {
         let group_idx = groups.len();
@@ -82,17 +78,19 @@ pub fn merge(
             let mut name_counts: HashMap<&str, usize> = HashMap::new();
             for &m in members {
                 let count = pair_counts[&pairs[m]];
-                *name_counts.entry(&pairs[m].0).or_insert(0) += count;
+                *name_counts.entry(pairs[m].0).or_insert(0) += count;
             }
             name_counts
                 .iter()
-                .max_by_key(|(_, count)| *count)
+                .max_by_key(|(name, count)| (*count, *name))
                 .map(|(name, _)| name.to_string())
                 .unwrap_or_else(|| "Unknown".to_string())
         };
 
-        let aliases: Vec<(String, String)> =
-            members.iter().map(|&m| pairs[m].clone()).collect();
+        let aliases: Vec<(String, String)> = members
+            .iter()
+            .map(|&m| (pairs[m].0.to_string(), pairs[m].1.to_string()))
+            .collect();
 
         groups.push(IdentityGroup {
             display_name,
@@ -100,25 +98,43 @@ pub fn merge(
         });
 
         for &m in members {
-            pair_to_group.insert(pairs[m].clone(), group_idx);
+            pair_to_group[m] = group_idx;
         }
     }
 
     let assignments: Vec<usize> = commits
         .iter()
-        .map(|c| pair_to_group[&(c.author_name.clone(), c.author_email.clone())])
+        .map(|c| {
+            let pi = pair_index[&(c.author_name.as_str(), c.author_email.as_str())];
+            pair_to_group[pi]
+        })
         .collect();
 
-    (groups, assignments, pair_to_group)
+    (groups, assignments)
+}
+
+fn union_all(parent: &mut [usize], rank: &mut [usize], indices: &[usize]) {
+    for w in indices.windows(2) {
+        union(parent, rank, w[0], w[1]);
+    }
 }
 
 fn apply_mailmap(
-    pairs: &[(String, String)],
+    pairs: &[(&str, &str)],
     mailmap: &[MailmapEntry],
     parent: &mut [usize],
     rank: &mut [usize],
 ) -> HashMap<usize, String> {
     let mut canonical_names: HashMap<usize, String> = HashMap::new();
+
+    let find_indices = |predicate: &dyn Fn(&str, &str) -> bool| -> Vec<usize> {
+        pairs
+            .iter()
+            .enumerate()
+            .filter(|(_, (n, e))| predicate(n, e))
+            .map(|(i, _)| i)
+            .collect()
+    };
 
     for entry in mailmap {
         let commit_email = match &entry.commit_email {
@@ -126,30 +142,13 @@ fn apply_mailmap(
             None => continue,
         };
 
-        let canonical_indices: Vec<usize> = pairs
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, e))| e.eq_ignore_ascii_case(&entry.canonical_email))
-            .map(|(i, _)| i)
-            .collect();
+        let canonical_indices = find_indices(&|_n, e| e.eq_ignore_ascii_case(&entry.canonical_email));
 
-        let commit_indices: Vec<usize> = if let Some(ref cname) = entry.commit_name {
-            pairs
-                .iter()
-                .enumerate()
-                .filter(|(_, (n, e))| {
-                    e.eq_ignore_ascii_case(commit_email)
-                        && n.eq_ignore_ascii_case(cname)
-                })
-                .map(|(i, _)| i)
-                .collect()
-        } else {
-            pairs
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, e))| e.eq_ignore_ascii_case(commit_email))
-                .map(|(i, _)| i)
-                .collect()
+        let commit_indices = match &entry.commit_name {
+            Some(cname) => find_indices(&|n, e| {
+                e.eq_ignore_ascii_case(commit_email) && n.eq_ignore_ascii_case(cname)
+            }),
+            None => find_indices(&|_n, e| e.eq_ignore_ascii_case(commit_email)),
         };
 
         let all_indices: Vec<usize> = canonical_indices
@@ -158,9 +157,7 @@ fn apply_mailmap(
             .copied()
             .collect();
 
-        for w in all_indices.windows(2) {
-            union(parent, rank, w[0], w[1]);
-        }
+        union_all(parent, rank, &all_indices);
 
         if let Some(ref name) = entry.canonical_name {
             if let Some(&first) = all_indices.first() {

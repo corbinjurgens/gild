@@ -1,7 +1,9 @@
-use crate::git::RepoInfo;
+use crate::fmt::{MONTHS, SECONDS_PER_DAY, SECONDS_PER_WEEK};
+use crate::git::{Commit, RepoInfo};
 use crate::identity::IdentityGroup;
 use chrono::{DateTime, Datelike, Timelike};
 use crossterm::event::{KeyCode, KeyEvent};
+use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -17,6 +19,17 @@ pub struct AuthorStats {
     pub impact: f64,
     pub ownership_lines: usize,
     pub ownership_pct: f64,
+    pub change_types: ChangeBreakdown,
+}
+
+#[derive(Clone, Default)]
+pub struct ChangeBreakdown {
+    pub feature: usize,
+    pub refactor: usize,
+    pub trivial: usize,
+    pub new_files: usize,
+    pub deleted_files: usize,
+    pub whitespace_lines: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -24,6 +37,12 @@ pub enum ViewMode {
     Table,
     Graph,
     Detail,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Theme {
+    Normal,
+    Readable,
 }
 
 pub struct GraphRow {
@@ -37,10 +56,20 @@ pub struct GraphData {
     pub rows: Vec<GraphRow>,
 }
 
+pub struct FileEvent {
+    pub path: String,
+    pub timestamp: i64,
+    pub lines: usize,
+}
+
 pub struct DetailData {
     pub author: AuthorStats,
+    pub prev_name: Option<String>,
+    pub next_name: Option<String>,
     pub top_files: Vec<(String, usize)>,
     pub activity: [[usize; 24]; 7],
+    pub recent_added: Vec<FileEvent>,
+    pub recent_deleted: Vec<FileEvent>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -51,6 +80,7 @@ pub enum SortMode {
     NetLines,
     FilesChanged,
     Impact,
+    Noise,
     Ownership,
 }
 
@@ -63,6 +93,7 @@ impl SortMode {
             SortMode::NetLines => "net",
             SortMode::FilesChanged => "files",
             SortMode::Impact => "impact",
+            SortMode::Noise => "noise",
             SortMode::Ownership => "own",
         }
     }
@@ -75,17 +106,19 @@ impl SortMode {
             SortMode::NetLines => "n",
             SortMode::FilesChanged => "f",
             SortMode::Impact => "i",
+            SortMode::Noise => "N",
             SortMode::Ownership => "o",
         }
     }
 
-    pub const ALL: [SortMode; 7] = [
+    pub const ALL: [SortMode; 8] = [
         SortMode::Commits,
         SortMode::LinesAdded,
         SortMode::LinesRemoved,
         SortMode::NetLines,
         SortMode::FilesChanged,
         SortMode::Impact,
+        SortMode::Noise,
         SortMode::Ownership,
     ];
 }
@@ -118,6 +151,14 @@ impl TimeMode {
     }
 }
 
+pub fn noise_pct(author: &AuthorStats) -> f64 {
+    if author.commits == 0 {
+        0.0
+    } else {
+        author.change_types.trivial as f64 / author.commits as f64 * 100.0
+    }
+}
+
 fn sort_value_for(mode: SortMode, author: &AuthorStats) -> i64 {
     match mode {
         SortMode::Commits => author.commits as i64,
@@ -126,17 +167,9 @@ fn sort_value_for(mode: SortMode, author: &AuthorStats) -> i64 {
         SortMode::NetLines => author.lines_added as i64 - author.lines_removed as i64,
         SortMode::FilesChanged => author.files_changed as i64,
         SortMode::Impact => (author.impact * 100.0) as i64,
+        SortMode::Noise => (noise_pct(author) * 100.0) as i64,
         SortMode::Ownership => author.ownership_lines as i64,
     }
-}
-
-pub struct CommitEntry {
-    pub group_id: usize,
-    pub lines_added: usize,
-    pub lines_removed: usize,
-    pub files_changed: usize,
-    pub timestamp: i64,
-    pub files: Vec<String>,
 }
 
 pub struct App {
@@ -152,8 +185,13 @@ pub struct App {
     pub total_authors: usize,
     pub filtered_commits: usize,
     pub has_ownership: bool,
+    pub theme: Theme,
+    pub show_theme_picker: bool,
+    detail_group_id: Option<usize>,
     sorted_indices: Vec<usize>,
-    commits: Vec<CommitEntry>,
+    graph_cache: RefCell<Option<GraphData>>,
+    detail_cache: RefCell<Option<(usize, DetailData)>>,
+    commits: Vec<Commit>,
     groups: Vec<IdentityGroup>,
     ownership_per_group: Vec<usize>,
     ownership_total: usize,
@@ -163,7 +201,7 @@ pub struct App {
 
 impl App {
     pub fn new(
-        commits: Vec<CommitEntry>,
+        commits: Vec<Commit>,
         groups: Vec<IdentityGroup>,
         info: RepoInfo,
     ) -> Self {
@@ -174,7 +212,7 @@ impl App {
         let mut app = Self {
             authors: Vec::new(),
             sort_mode: SortMode::Impact,
-            time_mode: TimeMode::All,
+            time_mode: TimeMode::Year,
             time_offset: 0,
             view_mode: ViewMode::Table,
             selected: 0,
@@ -184,7 +222,12 @@ impl App {
             total_authors: groups.len(),
             filtered_commits: total_commits,
             has_ownership: false,
+            theme: Theme::Normal,
+            show_theme_picker: true,
+            detail_group_id: None,
             sorted_indices: Vec::new(),
+            graph_cache: RefCell::new(None),
+            detail_cache: RefCell::new(None),
             commits,
             groups,
             ownership_per_group: Vec::new(),
@@ -196,7 +239,7 @@ impl App {
         app
     }
 
-    pub fn commit_entries(&self) -> &[CommitEntry] {
+    pub fn commits(&self) -> &[Commit] {
         &self.commits
     }
 
@@ -210,19 +253,14 @@ impl App {
     fn recompute(&mut self) {
         let (start, end) = self.time_bounds();
 
-        let mut group_data: Vec<Vec<(i64, usize, usize, usize)>> =
-            vec![Vec::new(); self.groups.len()];
+        let mut group_data: Vec<Vec<&Commit>> =
+            (0..self.groups.len()).map(|_| Vec::new()).collect();
 
         for entry in &self.commits {
             if entry.timestamp < start || entry.timestamp >= end {
                 continue;
             }
-            group_data[entry.group_id].push((
-                entry.timestamp,
-                entry.lines_added,
-                entry.lines_removed,
-                entry.files_changed,
-            ));
+            group_data[entry.group_id].push(entry);
         }
 
         let mut authors = Vec::new();
@@ -233,31 +271,12 @@ impl App {
                 continue;
             }
 
-            data.sort_by_key(|&(ts, _, _, _)| ts);
+            data.sort_by_key(|c| c.timestamp);
 
-            let mut commits = 0;
-            let mut lines_added = 0;
-            let mut lines_removed = 0;
-            let mut files_changed = 0;
+            let author_stats = aggregate_group(gid, data, &self.groups[gid].display_name);
+            total += author_stats.commits;
 
-            for &(_, la, lr, fc) in data.iter() {
-                commits += 1;
-                lines_added += la;
-                lines_removed += lr;
-                files_changed += fc;
-            }
-            total += commits;
-
-            let first_commit = data.first().unwrap().0;
-            let last_commit = data.last().unwrap().0;
-
-            let impact = compute_impact(data);
-
-            let ownership_lines = if gid < self.ownership_per_group.len() {
-                self.ownership_per_group[gid]
-            } else {
-                0
-            };
+            let ownership_lines = self.ownership_per_group.get(gid).copied().unwrap_or(0);
             let ownership_pct = if self.ownership_total > 0 {
                 ownership_lines as f64 / self.ownership_total as f64 * 100.0
             } else {
@@ -265,17 +284,9 @@ impl App {
             };
 
             authors.push(AuthorStats {
-                display_name: self.groups[gid].display_name.clone(),
-                group_id: gid,
-                commits,
-                lines_added,
-                lines_removed,
-                files_changed,
-                first_commit,
-                last_commit,
-                impact,
                 ownership_lines,
                 ownership_pct,
+                ..author_stats
             });
         }
 
@@ -325,10 +336,6 @@ impl App {
             TimeMode::Month => {
                 let dt = ts_to_dt(self.latest);
                 let (y, m) = offset_month(dt.year(), dt.month(), self.time_offset);
-                const MONTHS: [&str; 12] = [
-                    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-                ];
                 format!("{} {}", MONTHS[(m - 1) as usize], y)
             }
         }
@@ -339,16 +346,25 @@ impl App {
         start > self.earliest
     }
 
-    pub fn sorted_authors(&self) -> Vec<&AuthorStats> {
-        self.sorted_indices
-            .iter()
-            .map(|&i| &self.authors[i])
-            .collect()
+    pub fn sorted_authors(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &AuthorStats> + DoubleEndedIterator + Clone + '_ {
+        self.sorted_indices.iter().map(|&i| &self.authors[i])
     }
 
-    pub fn sort_value(&self, author: &AuthorStats) -> i64 {
-        sort_value_for(self.sort_mode, author)
+    pub fn sorted_author_at(&self, pos: usize) -> Option<&AuthorStats> {
+        self.sorted_indices.get(pos).map(|&i| &self.authors[i])
     }
+
+    pub fn sorted_author_count(&self) -> usize {
+        self.sorted_indices.len()
+    }
+
+    pub fn overall_time_range(&self) -> (i64, i64) {
+        (self.earliest, self.latest)
+    }
+
+
 
     fn resort(&mut self) {
         self.sorted_indices = (0..self.authors.len()).collect();
@@ -360,9 +376,18 @@ impl App {
             vb.cmp(&va)
         });
         self.selected = 0;
+        self.invalidate_caches();
+    }
+
+    fn invalidate_caches(&mut self) {
+        self.graph_cache.get_mut().take();
+        self.detail_cache.get_mut().take();
     }
 
     fn set_sort(&mut self, mode: SortMode) {
+        if mode == SortMode::Ownership && !self.has_ownership {
+            return;
+        }
         if self.sort_mode != mode {
             self.sort_mode = mode;
             self.resort();
@@ -390,17 +415,81 @@ impl App {
         self.recompute();
     }
 
-    pub fn detail_data(&self) -> Option<DetailData> {
+    fn empty_author(&self, gid: usize) -> AuthorStats {
+        let ownership_lines = self.ownership_per_group.get(gid).copied().unwrap_or(0);
+        let ownership_pct = if self.ownership_total > 0 {
+            ownership_lines as f64 / self.ownership_total as f64 * 100.0
+        } else {
+            0.0
+        };
+        AuthorStats {
+            display_name: self.groups[gid].display_name.clone(),
+            group_id: gid,
+            commits: 0,
+            lines_added: 0,
+            lines_removed: 0,
+            files_changed: 0,
+            first_commit: 0,
+            last_commit: 0,
+            impact: 0.0,
+            ownership_lines,
+            ownership_pct,
+            change_types: ChangeBreakdown::default(),
+        }
+    }
+
+    pub fn detail_data(&self) -> Option<Ref<'_, DetailData>> {
         if self.view_mode != ViewMode::Detail {
             return None;
         }
-        let sorted = self.sorted_authors();
-        let author = (*sorted.get(self.selected)?).clone();
-        let gid = author.group_id;
+        let gid = self.detail_group_id?;
+        if gid >= self.groups.len() {
+            return None;
+        }
+        let cache_hit = self
+            .detail_cache
+            .borrow()
+            .as_ref()
+            .map(|(k, _)| *k == gid)
+            .unwrap_or(false);
+        if !cache_hit {
+            let data = self.compute_detail_data(gid)?;
+            *self.detail_cache.borrow_mut() = Some((gid, data));
+        }
+        Some(Ref::map(self.detail_cache.borrow(), |o| &o.as_ref().unwrap().1))
+    }
+
+    fn compute_detail_data(&self, gid: usize) -> Option<DetailData> {
+        let author = self
+            .authors
+            .iter()
+            .find(|a| a.group_id == gid)
+            .cloned()
+            .unwrap_or_else(|| self.empty_author(gid));
+
+        let (prev_name, next_name) = match self.sorted_authors().position(|a| a.group_id == gid) {
+            Some(pos) => {
+                let prev = pos
+                    .checked_sub(1)
+                    .and_then(|p| self.sorted_author_at(p))
+                    .map(|a| a.display_name.clone());
+                let next = self.sorted_author_at(pos + 1).map(|a| a.display_name.clone());
+                (prev, next)
+            }
+            None => (
+                self.sorted_author_at(self.sorted_author_count().saturating_sub(1))
+                    .map(|a| a.display_name.clone()),
+                self.sorted_author_at(0).map(|a| a.display_name.clone()),
+            ),
+        };
+
         let (start, end) = self.time_bounds();
 
         let mut file_counts: HashMap<String, usize> = HashMap::new();
         let mut activity = [[0usize; 24]; 7];
+
+        let mut added_files: Vec<FileEvent> = Vec::new();
+        let mut deleted_files: Vec<FileEvent> = Vec::new();
 
         for entry in &self.commits {
             if entry.group_id != gid {
@@ -420,20 +509,95 @@ impl App {
                 let hour = local.hour() as usize;
                 activity[dow][hour] += 1;
             }
+
+            let lines_per_file = if entry.files_changed > 0 {
+                (entry.lines_added + entry.lines_removed) / entry.files_changed.max(1)
+            } else {
+                0
+            };
+            for f in &entry.added_file_names {
+                added_files.push(FileEvent {
+                    path: f.clone(),
+                    timestamp: entry.timestamp,
+                    lines: lines_per_file,
+                });
+            }
+            for f in &entry.deleted_file_names {
+                deleted_files.push(FileEvent {
+                    path: f.clone(),
+                    timestamp: entry.timestamp,
+                    lines: lines_per_file,
+                });
+            }
         }
 
         let mut top_files: Vec<(String, usize)> = file_counts.into_iter().collect();
         top_files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         top_files.truncate(20);
 
+        added_files.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.lines.cmp(&a.lines)));
+        deleted_files.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.lines.cmp(&a.lines)));
+        added_files.truncate(10);
+        deleted_files.truncate(10);
+
         Some(DetailData {
             author,
+            prev_name,
+            next_name,
             top_files,
             activity,
+            recent_added: added_files,
+            recent_deleted: deleted_files,
         })
     }
 
+    fn detail_navigate(&mut self, delta: i32) {
+        let gid = match self.detail_group_id {
+            Some(g) => g,
+            None => return,
+        };
+        let count = self.sorted_author_count();
+        if count == 0 {
+            return;
+        }
+        let new_gid = match self.sorted_authors().position(|a| a.group_id == gid) {
+            Some(pos) => {
+                let new_pos = if delta < 0 {
+                    pos.saturating_sub(1)
+                } else {
+                    (pos + 1).min(count - 1)
+                };
+                self.sorted_author_at(new_pos).unwrap().group_id
+            }
+            None => {
+                let fallback = if delta < 0 { count - 1 } else { 0 };
+                self.sorted_author_at(fallback).unwrap().group_id
+            }
+        };
+        if Some(new_gid) != self.detail_group_id {
+            self.detail_group_id = Some(new_gid);
+            self.detail_scroll = 0;
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if self.show_theme_picker {
+            match key.code {
+                KeyCode::Char('n') | KeyCode::Char('N') => self.theme = Theme::Normal,
+                KeyCode::Char('r') | KeyCode::Char('R') => self.theme = Theme::Readable,
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    self.theme = match self.theme {
+                        Theme::Normal => Theme::Readable,
+                        Theme::Readable => Theme::Normal,
+                    };
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => self.show_theme_picker = false,
+                KeyCode::Esc | KeyCode::Char('q') => return true,
+                _ => {}
+            }
+            return false;
+        }
+
         if self.view_mode == ViewMode::Detail {
             return self.handle_detail_key(key);
         }
@@ -446,7 +610,9 @@ impl App {
             KeyCode::Char('n') => self.set_sort(SortMode::NetLines),
             KeyCode::Char('f') => self.set_sort(SortMode::FilesChanged),
             KeyCode::Char('i') => self.set_sort(SortMode::Impact),
+            KeyCode::Char('N') => self.set_sort(SortMode::Noise),
             KeyCode::Char('o') => self.set_sort(SortMode::Ownership),
+            KeyCode::Char('T') => self.show_theme_picker = true,
             KeyCode::Char('g') => {
                 self.view_mode = match self.view_mode {
                     ViewMode::Table => ViewMode::Graph,
@@ -470,7 +636,8 @@ impl App {
                 self.selected = self.authors.len().saturating_sub(1);
             }
             KeyCode::Enter => {
-                if !self.authors.is_empty() {
+                if let Some(author) = self.sorted_author_at(self.selected) {
+                    self.detail_group_id = Some(author.group_id);
                     self.view_mode = ViewMode::Detail;
                     self.detail_scroll = 0;
                 }
@@ -483,14 +650,27 @@ impl App {
     fn handle_detail_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc | KeyCode::Backspace => {
+                if let Some(gid) = self.detail_group_id {
+                    let pos = self.sorted_authors().position(|a| a.group_id == gid);
+                    if let Some(pos) = pos {
+                        self.selected = pos;
+                    }
+                }
+                self.detail_group_id = None;
                 self.view_mode = ViewMode::Table;
             }
             KeyCode::Char('q') => return true,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.detail_scroll = self.detail_scroll.saturating_sub(1);
+            KeyCode::Char('t') => self.set_time_mode(self.time_mode.next()),
+            KeyCode::Char('T') => self.show_theme_picker = true,
+            KeyCode::Left | KeyCode::Char('[') => self.time_navigate(-1),
+            KeyCode::Right | KeyCode::Char(']') => self.time_navigate(1),
+            KeyCode::Up | KeyCode::Char('k') => self.detail_navigate(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.detail_navigate(1),
+            KeyCode::PageUp => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(5);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.detail_scroll += 1;
+            KeyCode::PageDown => {
+                self.detail_scroll = (self.detail_scroll + 5).min(DETAIL_SCROLL_MAX);
             }
             KeyCode::Home => self.detail_scroll = 0,
             _ => {}
@@ -498,7 +678,15 @@ impl App {
         false
     }
 
-    pub fn graph_data(&self) -> GraphData {
+    pub fn graph_data(&self) -> Ref<'_, GraphData> {
+        if self.graph_cache.borrow().is_none() {
+            let data = self.compute_graph_data();
+            *self.graph_cache.borrow_mut() = Some(data);
+        }
+        Ref::map(self.graph_cache.borrow(), |o| o.as_ref().unwrap())
+    }
+
+    fn compute_graph_data(&self) -> GraphData {
         use ratatui::style::Color;
 
         const PALETTE: [Color; 8] = [
@@ -515,7 +703,7 @@ impl App {
         let (raw_start, raw_end) = self.time_bounds();
         let start = if raw_start == 0 { self.earliest } else { raw_start };
         let end = if raw_end == i64::MAX {
-            self.latest + 86400
+            self.latest + SECONDS_PER_DAY
         } else {
             raw_end
         };
@@ -523,9 +711,13 @@ impl App {
         let (boundaries, labels) = period_boundaries(start, end);
         let num_periods = labels.len();
 
-        let sorted = self.sorted_authors();
-        let top_n = 8.min(sorted.len());
-        let top_ids: Vec<usize> = sorted.iter().take(top_n).map(|a| a.group_id).collect();
+        let total_authors = self.sorted_author_count();
+        let top_n = GRAPH_TOP_N.min(total_authors);
+        let top_ids: Vec<usize> = self
+            .sorted_authors()
+            .take(top_n)
+            .map(|a| a.group_id)
+            .collect();
 
         let num_slots = top_n + 1;
         let mut per_author: Vec<Vec<(i64, usize, usize)>> = vec![Vec::new(); num_slots];
@@ -582,18 +774,21 @@ impl App {
             }
         }
 
-        let mut rows: Vec<GraphRow> = (0..top_n)
-            .map(|i| GraphRow {
-                name: sorted[i].display_name.clone(),
-                data: buckets[i].clone(),
+        let mut rows: Vec<GraphRow> = self
+            .sorted_authors()
+            .take(top_n)
+            .enumerate()
+            .map(|(i, a)| GraphRow {
+                name: a.display_name.clone(),
+                data: std::mem::take(&mut buckets[i]),
                 color: PALETTE[i % PALETTE.len()],
             })
             .collect();
 
-        if sorted.len() > top_n {
+        if total_authors > top_n {
             rows.push(GraphRow {
                 name: "others".to_string(),
-                data: buckets[top_n].clone(),
+                data: std::mem::take(&mut buckets[top_n]),
                 color: Color::Rgb(108, 118, 148),
             });
         }
@@ -626,115 +821,173 @@ fn month_ts(year: i32, month: u32) -> i64 {
         .timestamp()
 }
 
+const QUARTERLY_THRESHOLD_DAYS: i64 = 730;
+const MONTHLY_THRESHOLD_DAYS: i64 = 120;
+
 fn period_boundaries(start: i64, end: i64) -> (Vec<i64>, Vec<String>) {
-    let span_days = (end - start) / 86400;
-    if span_days > 730 {
-        gen_quarterly_boundaries(start, end)
-    } else if span_days > 120 {
-        gen_monthly_boundaries(start, end)
+    let span_days = (end - start) / SECONDS_PER_DAY;
+    if span_days > QUARTERLY_THRESHOLD_DAYS {
+        collect_boundaries(quarterly_iter(start), end)
+    } else if span_days > MONTHLY_THRESHOLD_DAYS {
+        collect_boundaries(monthly_iter(start), end)
     } else {
-        gen_weekly_boundaries(start, end)
+        collect_boundaries(weekly_iter(start), end)
     }
 }
 
-fn gen_quarterly_boundaries(start: i64, end: i64) -> (Vec<i64>, Vec<String>) {
-    let dt = ts_to_dt(start);
+fn collect_boundaries(
+    iter: impl Iterator<Item = (i64, String)>,
+    end: i64,
+) -> (Vec<i64>, Vec<String>) {
     let mut boundaries = Vec::new();
     let mut labels = Vec::new();
+    for (ts, label) in iter {
+        if ts >= end {
+            break;
+        }
+        boundaries.push(ts);
+        labels.push(label);
+    }
+    boundaries.push(end);
+    (boundaries, labels)
+}
+
+fn quarterly_iter(start: i64) -> impl Iterator<Item = (i64, String)> {
+    let dt = ts_to_dt(start);
     let q_start = ((dt.month() - 1) / 3) * 3 + 1;
     let (mut y, mut m) = (dt.year(), q_start);
-    loop {
+    std::iter::from_fn(move || {
         let ts = month_ts(y, m);
-        if ts >= end {
-            break;
-        }
-        boundaries.push(ts);
         let q = (m - 1) / 3 + 1;
-        labels.push(format!("{}Q{}", y, q));
-        let next = offset_month(y, m, 3);
-        y = next.0;
-        m = next.1;
-    }
-    boundaries.push(end);
-    (boundaries, labels)
+        let label = format!("{}Q{}", y, q);
+        (y, m) = offset_month(y, m, 3);
+        Some((ts, label))
+    })
 }
 
-fn gen_monthly_boundaries(start: i64, end: i64) -> (Vec<i64>, Vec<String>) {
+fn monthly_iter(start: i64) -> impl Iterator<Item = (i64, String)> {
     let dt = ts_to_dt(start);
-    let mut boundaries = Vec::new();
-    let mut labels = Vec::new();
     let (mut y, mut m) = (dt.year(), dt.month());
-    loop {
+    std::iter::from_fn(move || {
         let ts = month_ts(y, m);
-        if ts >= end {
-            break;
-        }
-        boundaries.push(ts);
-        const MO: [&str; 12] = [
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-        ];
-        labels.push(if m == 1 {
-            format!("{}", y)
+        let label = if m == 1 {
+            y.to_string()
         } else {
-            MO[(m - 1) as usize].to_string()
-        });
-        let next = offset_month(y, m, 1);
-        y = next.0;
-        m = next.1;
-    }
-    boundaries.push(end);
-    (boundaries, labels)
+            MONTHS[(m - 1) as usize].to_string()
+        };
+        (y, m) = offset_month(y, m, 1);
+        Some((ts, label))
+    })
 }
 
-fn gen_weekly_boundaries(start: i64, end: i64) -> (Vec<i64>, Vec<String>) {
-    let mut boundaries = Vec::new();
-    let mut labels = Vec::new();
-    let aligned = (start / 604800) * 604800;
-    let mut ts = aligned;
-    loop {
-        if ts >= end {
-            break;
-        }
-        boundaries.push(ts);
-        let dt = ts_to_dt(ts);
-        labels.push(format!("{:02}/{:02}", dt.month(), dt.day()));
-        ts += 604800;
-    }
-    boundaries.push(end);
-    (boundaries, labels)
+fn weekly_iter(start: i64) -> impl Iterator<Item = (i64, String)> {
+    let mut ts = (start / SECONDS_PER_WEEK) * SECONDS_PER_WEEK;
+    std::iter::from_fn(move || {
+        let current = ts;
+        let dt = ts_to_dt(current);
+        let label = format!("{:02}/{:02}", dt.month(), dt.day());
+        ts += SECONDS_PER_WEEK;
+        Some((current, label))
+    })
 }
 
 const SESSION_GAP_SECS: i64 = 30 * 60;
+const GRAPH_TOP_N: usize = 8;
+const DETAIL_SCROLL_MAX: usize = 200;
 
-fn compute_impact(sorted_commits: &[(i64, usize, usize, usize)]) -> f64 {
+enum ChangeKind {
+    Feature,
+    Refactor,
+    Trivial,
+}
+
+fn classify_commit(c: &Commit) -> ChangeKind {
+    let total_lines = c.lines_added + c.lines_removed;
+    let ws_total = c.whitespace_added + c.whitespace_removed;
+    let is_whitespace_only = total_lines > 0 && ws_total >= total_lines;
+    let is_trivial = total_lines <= 5 && c.files.len() <= 1;
+
+    if is_whitespace_only || is_trivial {
+        ChangeKind::Trivial
+    } else if c.files_added > 0 && c.files_deleted == 0 {
+        ChangeKind::Feature
+    } else if c.files_deleted > 0 && c.files_added == 0 {
+        ChangeKind::Refactor
+    } else {
+        let add_ratio = c.lines_added as f64 / (c.lines_removed.max(1)) as f64;
+        if add_ratio > 2.0 || c.files_added > 0 {
+            ChangeKind::Feature
+        } else {
+            ChangeKind::Refactor
+        }
+    }
+}
+
+fn aggregate_group(gid: usize, sorted: &[&Commit], display_name: &str) -> AuthorStats {
+    let mut change_types = ChangeBreakdown::default();
+    let mut lines_added = 0;
+    let mut lines_removed = 0;
+    let mut files_changed = 0;
+
+    for c in sorted {
+        lines_added += c.lines_added;
+        lines_removed += c.lines_removed;
+        files_changed += c.files.len();
+        change_types.whitespace_lines += c.whitespace_added + c.whitespace_removed;
+        change_types.new_files += c.files_added;
+        change_types.deleted_files += c.files_deleted;
+        match classify_commit(c) {
+            ChangeKind::Feature => change_types.feature += 1,
+            ChangeKind::Refactor => change_types.refactor += 1,
+            ChangeKind::Trivial => change_types.trivial += 1,
+        }
+    }
+
+    AuthorStats {
+        display_name: display_name.to_string(),
+        group_id: gid,
+        commits: sorted.len(),
+        lines_added,
+        lines_removed,
+        files_changed,
+        first_commit: sorted.first().unwrap().timestamp,
+        last_commit: sorted.last().unwrap().timestamp,
+        impact: compute_impact(sorted),
+        ownership_lines: 0,
+        ownership_pct: 0.0,
+        change_types,
+    }
+}
+
+fn compute_impact(sorted_commits: &[&Commit]) -> f64 {
     if sorted_commits.is_empty() {
         return 0.0;
     }
 
-    let mut total_impact = 0.0;
-    let mut sess_lines = 0usize;
-    let mut sess_files = 0usize;
-    let mut last_ts = sorted_commits[0].0;
-    let mut in_session = false;
+    let mut total_lines = 0usize;
+    let mut total_ws = 0usize;
+    let mut unique_files = std::collections::HashSet::new();
+    let mut sessions = 1usize;
+    let mut last_ts = sorted_commits[0].timestamp;
 
-    for &(ts, la, lr, fc) in sorted_commits {
-        if in_session && ts - last_ts > SESSION_GAP_SECS {
-            total_impact += session_value(sess_lines, sess_files);
-            sess_lines = 0;
-            sess_files = 0;
+    for c in sorted_commits {
+        total_lines += c.lines_added + c.lines_removed;
+        total_ws += c.whitespace_added + c.whitespace_removed;
+        for f in &c.files {
+            unique_files.insert(f.as_str());
         }
-        sess_lines += la + lr;
-        sess_files += fc;
-        last_ts = ts;
-        in_session = true;
+        if c.timestamp - last_ts > SESSION_GAP_SECS {
+            sessions += 1;
+        }
+        last_ts = c.timestamp;
     }
 
-    if in_session {
-        total_impact += session_value(sess_lines, sess_files);
-    }
+    let substantive_lines = total_lines.saturating_sub(total_ws);
+    let ws_contribution = total_ws as f64 * 0.1;
+    let effective_lines = substantive_lines as f64 + ws_contribution;
 
-    total_impact
+    let substance = session_value(effective_lines as usize, unique_files.len());
+    substance * (1.0 + 0.15 * (sessions as f64).ln())
 }
 
 fn session_value(lines: usize, files: usize) -> f64 {
