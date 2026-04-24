@@ -10,14 +10,14 @@ pub const MONTHS: [&str; 12] = [
 
 pub fn fmt_num(n: usize) -> String {
     let s = n.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
         }
-        result.push(c);
+        out.push(c);
     }
-    result.chars().rev().collect()
+    out
 }
 
 pub fn fmt_date(timestamp: i64, format: &str) -> String {

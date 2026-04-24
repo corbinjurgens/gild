@@ -54,6 +54,8 @@ Run `gild` with no arguments to analyze the current directory.
 
 ## TUI keys
 
+### Table / graph view
+
 | Key | Action |
 |-----|--------|
 | `c` | Sort by commits |
@@ -62,22 +64,36 @@ Run `gild` with no arguments to analyze the current directory.
 | `n` | Sort by net lines |
 | `f` | Sort by files changed |
 | `i` | Sort by impact |
+| `N` | Sort by noise % |
 | `o` | Sort by ownership |
 | `t` | Cycle time window (all / year / quarter / month) |
-| `[` / `]` | Navigate time period |
+| `[` / `]` / `Left` / `Right` | Navigate time period |
 | `g` | Toggle table / graph view |
-| `Enter` | Detail drill-down (top files + activity heatmap) |
-| `j` / `k` / `Up` / `Down` | Scroll |
+| `T` | Theme picker (Normal / Readable) |
+| `Enter` | Detail drill-down (top files, activity heatmap, new/deleted files) |
+| `j` / `k` / `Up` / `Down` | Select author |
 | `Home` / `End` / `G` | Jump to top / bottom |
-| `Esc` | Back (from detail) or quit |
+| `Esc` / `q` | Quit |
+
+### Detail view
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` / `Up` / `Down` | Navigate between authors |
+| `t` | Cycle time window |
+| `[` / `]` / `Left` / `Right` | Navigate time period |
+| `T` | Theme picker |
+| `PageUp` / `PageDown` | Scroll detail content |
+| `Home` | Scroll to top |
+| `Esc` / `Backspace` | Back to table |
 | `q` | Quit |
 
 ## How it works
 
 - **Impact scoring** — measures total work substance, not commit count. The base score is `(1 + ln(1 + lines)) × (1 + 0.5 × ln(1 + unique_files))` computed on all lines added/removed and unique files touched (not double-counted across commits). A small consistency bonus `× (1 + 0.15 × ln(sessions))` rewards regular activity, where sessions are commit groups separated by 30-minute gaps. This means someone who makes 1 clean commit with 200 lines scores higher than someone who makes 5 typo-fix commits totaling 25 lines — commit-splitting can't inflate impact
 - **Identity deduplication** — union-find merges authors by email, `.mailmap`, and saved confirmations; an interactive questionnaire catches fuzzy matches (Levenshtein, substring, email heuristics)
-- **Code ownership** — for each file in HEAD, finds the most recent commit that touched it and counts lines; cached per HEAD hash in `.git/gild/ownership.json`
-- **Caching** — commit stats cached in `.git/gild/cache.json` by hash; subsequent runs are near-instant
+- **Code ownership** — for each file in HEAD, finds the most recent commit that touched it and counts lines; cached per HEAD hash in the per-repo SQLite database
+- **Caching** — commit stats cached in a per-repo SQLite database by commit hash; subsequent runs are near-instant. Database lives in the platform data dir (`~/Library/Application Support/gild/` on macOS), keyed by remote origin URL so local clones and remote URL inputs share the same cache
 
 ## How merges are counted
 
@@ -101,14 +117,18 @@ If your team uses squash merges, contribution data will be skewed toward the per
 
 | File | Role |
 |------|------|
+| `main.rs` | CLI via clap, orchestration |
+| `storage.rs` | Resolves per-repo data dir from origin URL or path hash |
+| `db.rs` | SQLite connection, schema migrations |
 | `git.rs` | Walk commits via git2, compute diff stats + file paths |
-| `cache.rs` | On-disk commit stats cache (`.git/gild/cache.json`) |
+| `cache.rs` | SQLite-backed commit stats cache, keyed by commit hash |
 | `identity.rs` | Union-find identity merging from email, mailmap, saved rules |
-| `identity_map.rs` | Load/save confirmed merges and rejects (`.git/gild/identities.toml`) |
+| `identity_map.rs` | Load/save confirmed merges and rejects (`identities.toml`) |
 | `mailmap.rs` | Parse `.mailmap` for standard git identity mapping |
 | `questionnaire.rs` | Interactive fuzzy identity matcher |
-| `ownership.rs` | Code ownership via last-touch analysis + blob line counts |
-| `app.rs` | State machine: sort, time windows, impact scoring, views |
-| `ui.rs` | Ratatui TUI with Dracula colors, ranking, sparklines, heatmap |
+| `ownership.rs` | Code ownership via last-touch analysis + blob line counts; SQLite-backed |
+| `app.rs` | State machine: sort, time windows, impact scoring, commit classification, views |
+| `ui.rs` | Ratatui TUI with Dracula colors, table/graph/detail views |
 | `export.rs` | JSON, CSV, HTML export |
-| `main.rs` | CLI via clap, orchestration |
+| `fmt.rs` | Number/date formatting helpers |
+| `util.rs` | Atomic file writes, safe TOML/text loading |

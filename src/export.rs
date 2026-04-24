@@ -71,6 +71,7 @@ fn author_to_json(rank: usize, a: &AuthorStats) -> serde_json::Value {
         "feature": ct.feature,
         "refactor": ct.refactor,
         "trivial": ct.trivial,
+        "merge": ct.merge,
         "new_files": ct.new_files,
         "deleted_files": ct.deleted_files,
         "whitespace_lines": ct.whitespace_lines,
@@ -81,14 +82,14 @@ fn author_to_json(rank: usize, a: &AuthorStats) -> serde_json::Value {
 
 fn export_csv(app: &App) -> String {
     let mut out = String::from(
-        "Rank,Author,Commits,Lines Added,Lines Removed,Net Lines,Files Changed,Impact,Ownership Lines,Ownership %,Feature,Refactor,Trivial,New Files,Deleted Files,Whitespace Lines,First Commit,Last Commit\n",
+        "Rank,Author,Commits,Lines Added,Lines Removed,Net Lines,Files Changed,Impact,Ownership Lines,Ownership %,Feature,Refactor,Trivial,Merge,New Files,Deleted Files,Whitespace Lines,First Commit,Last Commit\n",
     );
 
     for (i, a) in app.sorted_authors().enumerate() {
         let net = a.lines_added as i64 - a.lines_removed as i64;
         let ct = &a.change_types;
         out.push_str(&format!(
-            "{},\"{}\",{},{},{},{},{},{:.1},{},{:.1},{},{},{},{},{},{},{},{}\n",
+            "{},\"{}\",{},{},{},{},{},{:.1},{},{:.1},{},{},{},{},{},{},{},{},{}\n",
             i + 1,
             a.display_name.replace('"', "\"\""),
             a.commits,
@@ -102,6 +103,7 @@ fn export_csv(app: &App) -> String {
             ct.feature,
             ct.refactor,
             ct.trivial,
+            ct.merge,
             ct.new_files,
             ct.deleted_files,
             ct.whitespace_lines,

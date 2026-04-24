@@ -3,12 +3,11 @@ use anyhow::{Context, Result};
 use git2::{DiffLineType, DiffOptions, Repository, Sort};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub struct RepoInfo {
     pub name: String,
     pub branch: String,
-    pub git_dir: PathBuf,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -35,6 +34,8 @@ pub struct Commit {
     pub added_file_names: Vec<String>,
     #[serde(default)]
     pub deleted_file_names: Vec<String>,
+    #[serde(default)]
+    pub is_merge: bool,
 }
 
 pub fn load_commits(
@@ -67,7 +68,6 @@ pub fn load_commits(
     let info = RepoInfo {
         name: repo_name,
         branch: branch_name,
-        git_dir: repo.path().to_path_buf(),
     };
 
     let mut revwalk = repo.revwalk()?;
@@ -83,10 +83,19 @@ pub fn load_commits(
         let commit = repo.find_commit(oid)?;
 
         let raw = if let Some(cached) = cache.get(&hash) {
-            cached.clone()
+            cached
         } else {
             let tree = commit.tree()?;
-            let parent_tree = if commit.parent_count() > 0 {
+            let is_merge = commit.parent_count() > 1;
+
+            let parent_tree = if is_merge {
+                let parent_a = commit.parent_id(0)?;
+                let parent_b = commit.parent_id(1)?;
+                repo.merge_base(parent_a, parent_b)
+                    .ok()
+                    .and_then(|base_oid| repo.find_commit(base_oid).ok())
+                    .and_then(|base_commit| base_commit.tree().ok())
+            } else if commit.parent_count() > 0 {
                 Some(commit.parent(0)?.tree()?)
             } else {
                 None
@@ -146,6 +155,7 @@ pub fn load_commits(
                 files_deleted,
                 added_file_names,
                 deleted_file_names,
+                is_merge,
             };
 
             cache.insert(hash, raw.clone());
@@ -170,9 +180,9 @@ pub fn load_commits(
 fn count_whitespace_lines(diff: &git2::Diff<'_>) -> (usize, usize) {
     use std::cell::Cell;
 
-    let mut removed: HashMap<String, usize> = HashMap::new();
-    let mut added: HashMap<String, usize> = HashMap::new();
-    let file_idx = Cell::new(0usize);
+    // (file_idx, trimmed bytes) -> [added_count, removed_count]
+    let mut counts: HashMap<(u32, Vec<u8>), [u32; 2]> = HashMap::new();
+    let file_idx = Cell::new(0u32);
 
     let _ = diff.foreach(
         &mut |_delta, _progress| {
@@ -182,32 +192,43 @@ fn count_whitespace_lines(diff: &git2::Diff<'_>) -> (usize, usize) {
         None,
         None,
         Some(&mut |_delta, _hunk, line| {
-            let content = String::from_utf8_lossy(line.content());
-            let trimmed = content.trim();
-            let original = content.trim_end_matches('\n').trim_end_matches('\r');
-
-            if trimmed == original.trim() && trimmed != original {
-                let key = format!("{}:{}", file_idx.get(), trimmed);
-                match line.origin_value() {
-                    DiffLineType::Addition => *added.entry(key).or_default() += 1,
-                    DiffLineType::Deletion => *removed.entry(key).or_default() += 1,
-                    _ => {}
-                }
+            let slot = match line.origin_value() {
+                DiffLineType::Addition => 0,
+                DiffLineType::Deletion => 1,
+                _ => return true,
+            };
+            let original = strip_trailing_newline(line.content());
+            let trimmed = trim_ascii_ws(original);
+            if !trimmed.is_empty() && trimmed.len() != original.len() {
+                let key = (file_idx.get(), trimmed.to_vec());
+                counts.entry(key).or_insert([0, 0])[slot] += 1;
             }
             true
         }),
     );
 
-    let mut ws_add = 0usize;
-    let mut ws_rm = 0usize;
+    let paired: u32 = counts.values().map(|[a, r]| (*a).min(*r)).sum();
+    (paired as usize, paired as usize)
+}
 
-    for (key, del_count) in &removed {
-        if let Some(add_count) = added.get(key) {
-            let paired = (*del_count).min(*add_count);
-            ws_rm += paired;
-            ws_add += paired;
-        }
+fn strip_trailing_newline(mut bytes: &[u8]) -> &[u8] {
+    if let Some(b'\n') = bytes.last().copied() {
+        bytes = &bytes[..bytes.len() - 1];
     }
+    if let Some(b'\r') = bytes.last().copied() {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
 
-    (ws_add, ws_rm)
+fn trim_ascii_ws(bytes: &[u8]) -> &[u8] {
+    let mut start = 0;
+    while start < bytes.len() && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    let mut end = bytes.len();
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &bytes[start..end]
 }

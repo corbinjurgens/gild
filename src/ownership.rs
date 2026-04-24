@@ -1,34 +1,49 @@
 use anyhow::Result;
 use git2::{ObjectType, Repository, TreeWalkMode, TreeWalkResult};
-use serde::{Deserialize, Serialize};
+use rusqlite::params;
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
 
-use crate::cache::storage_dir;
+use crate::db::Database;
 use crate::git::Commit;
-use crate::util::{load_or_default, write_atomic};
+use crate::identity::IdentityGroup;
 
-#[derive(Serialize, Deserialize, Default)]
 pub struct OwnershipData {
-    pub head: String,
-    pub total_lines: usize,
-    pub authors: HashMap<usize, usize>,
+    pub by_email: Vec<(String, String, usize)>,
 }
 
 pub fn compute(
     repo: &Repository,
-    git_dir: &Path,
+    db: &Database,
     commits: &[Commit],
+    groups: &[IdentityGroup],
     on_progress: impl Fn(usize, usize),
 ) -> Result<OwnershipData> {
     let head = repo.head()?.peel_to_commit()?;
     let head_hash = head.id().to_string();
 
-    let cache_path = storage_dir(git_dir).join("ownership.json");
-    let cached: OwnershipData = load_or_default(&cache_path, |s| serde_json::from_str(s));
-    if cached.head == head_hash && !cached.authors.is_empty() {
-        return Ok(cached);
+    if db
+        .conn
+        .query_row(
+            "SELECT 1 FROM ownership_meta WHERE head_hash = ?1",
+            params![&head_hash],
+            |_| Ok(()),
+        )
+        .is_ok()
+    {
+        let mut stmt = db.conn.prepare(
+            "SELECT author_email, author_name, lines FROM ownership WHERE head_hash = ?1",
+        )?;
+        let rows = stmt.query_map(params![&head_hash], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)? as usize,
+            ))
+        })?;
+        let by_email: Vec<(String, String, usize)> = rows.collect::<Result<_, _>>()?;
+        if !by_email.is_empty() {
+            return Ok(OwnershipData { by_email });
+        }
     }
 
     let tree = head.tree()?;
@@ -59,18 +74,42 @@ pub fn compute(
         }
     }
 
+    let mut by_email: Vec<(String, String, usize)> = Vec::new();
+    for (&gid, &lines) in &group_lines {
+        if let Some(group) = groups.get(gid) {
+            if let Some((name, email)) = group.aliases.first() {
+                by_email.push((email.clone(), name.clone(), lines));
+            }
+        }
+    }
+
     on_progress(total_files, total_files);
 
-    let result = OwnershipData {
-        head: head_hash,
-        total_lines,
-        authors: group_lines,
-    };
+    let tx = db.conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM ownership WHERE head_hash = ?1",
+        params![&head_hash],
+    )?;
+    tx.execute(
+        "DELETE FROM ownership_meta WHERE head_hash = ?1",
+        params![&head_hash],
+    )?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO ownership (head_hash, author_email, author_name, lines)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (email, name, lines) in &by_email {
+            stmt.execute(params![&head_hash, email, name, *lines as i64])?;
+        }
+    }
+    tx.execute(
+        "INSERT INTO ownership_meta (head_hash, total_lines) VALUES (?1, ?2)",
+        params![&head_hash, total_lines as i64],
+    )?;
+    tx.commit()?;
 
-    fs::create_dir_all(storage_dir(git_dir))?;
-    write_atomic(&cache_path, serde_json::to_string(&result)?.as_bytes())?;
-
-    Ok(result)
+    Ok(OwnershipData { by_email })
 }
 
 fn walk_tree_sizes(repo: &Repository, tree: &git2::Tree) -> HashMap<String, usize> {
@@ -99,15 +138,12 @@ fn walk_tree_sizes(repo: &Repository, tree: &git2::Tree) -> HashMap<String, usiz
 }
 
 fn count_lines(content: &[u8]) -> usize {
-    if content.is_empty() {
-        return 0;
+    let nl = content.iter().filter(|&&b| b == b'\n').count();
+    match content.last() {
+        None => 0,
+        Some(&b'\n') => nl,
+        Some(_) => nl + 1,
     }
-    let nl = bytecount(content, b'\n');
-    if *content.last().unwrap() == b'\n' { nl } else { nl + 1 }
-}
-
-fn bytecount(haystack: &[u8], needle: u8) -> usize {
-    haystack.iter().filter(|&&b| b == needle).count()
 }
 
 const BINARY_EXTS: &[&str] = &[
@@ -139,17 +175,22 @@ fn is_likely_binary(path: &str) -> bool {
 
 pub fn map_to_groups(
     data: &OwnershipData,
-    num_groups: usize,
+    groups: &[IdentityGroup],
 ) -> (Vec<usize>, usize) {
-    let mut group_lines = vec![0usize; num_groups];
-    let mut mapped_total = 0usize;
-
-    for (&gid, &lines) in &data.authors {
-        if gid < num_groups {
-            group_lines[gid] += lines;
-            mapped_total += lines;
+    let mut email_to_gid: HashMap<String, usize> = HashMap::new();
+    for (gid, group) in groups.iter().enumerate() {
+        for (_name, email) in &group.aliases {
+            email_to_gid.insert(email.clone(), gid);
         }
     }
 
-    (group_lines, mapped_total)
+    let mut per_group = vec![0usize; groups.len()];
+    let mut mapped_total = 0usize;
+    for (email, _name, lines) in &data.by_email {
+        if let Some(&gid) = email_to_gid.get(email) {
+            per_group[gid] += lines;
+            mapped_total += lines;
+        }
+    }
+    (per_group, mapped_total)
 }

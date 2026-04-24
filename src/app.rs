@@ -1,10 +1,13 @@
 use crate::fmt::{MONTHS, SECONDS_PER_DAY, SECONDS_PER_WEEK};
 use crate::git::{Commit, RepoInfo};
 use crate::identity::IdentityGroup;
+use crate::identity_map::IdentityMap;
+use crate::mailmap::MailmapEntry;
 use chrono::{DateTime, Datelike, Timelike};
 use crossterm::event::{KeyCode, KeyEvent};
 use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 #[derive(Clone)]
 pub struct AuthorStats {
@@ -30,6 +33,7 @@ pub struct ChangeBreakdown {
     pub new_files: usize,
     pub deleted_files: usize,
     pub whitespace_lines: usize,
+    pub merge: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -62,14 +66,22 @@ pub struct FileEvent {
     pub lines: usize,
 }
 
+pub struct TrendPoint {
+    pub label: String,
+    pub value: u64,
+    pub is_current: bool,
+}
+
 pub struct DetailData {
     pub author: AuthorStats,
+    pub aliases: Vec<(String, String)>,
     pub prev_name: Option<String>,
     pub next_name: Option<String>,
     pub top_files: Vec<(String, usize)>,
     pub activity: [[usize; 24]; 7],
     pub recent_added: Vec<FileEvent>,
     pub recent_deleted: Vec<FileEvent>,
+    pub trend: Vec<TrendPoint>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -172,6 +184,18 @@ fn sort_value_for(mode: SortMode, author: &AuthorStats) -> i64 {
     }
 }
 
+pub struct QuestionnaireCandidate {
+    pub group_a: usize,
+    pub group_b: usize,
+}
+
+pub struct QuestionnaireState {
+    pub candidates: Vec<QuestionnaireCandidate>,
+    pub current: usize,
+    pub changed: bool,
+    pub last_action: Option<&'static str>,
+}
+
 pub struct App {
     pub authors: Vec<AuthorStats>,
     pub sort_mode: SortMode,
@@ -187,12 +211,16 @@ pub struct App {
     pub has_ownership: bool,
     pub theme: Theme,
     pub show_theme_picker: bool,
+    pub questionnaire: Option<QuestionnaireState>,
     detail_group_id: Option<usize>,
     sorted_indices: Vec<usize>,
     graph_cache: RefCell<Option<GraphData>>,
     detail_cache: RefCell<Option<(usize, DetailData)>>,
     commits: Vec<Commit>,
     groups: Vec<IdentityGroup>,
+    identity_map: IdentityMap,
+    identity_map_path: PathBuf,
+    mailmap_entries: Vec<MailmapEntry>,
     ownership_per_group: Vec<usize>,
     ownership_total: usize,
     earliest: i64,
@@ -204,10 +232,17 @@ impl App {
         commits: Vec<Commit>,
         groups: Vec<IdentityGroup>,
         info: RepoInfo,
+        identity_map: IdentityMap,
+        identity_map_path: PathBuf,
+        mailmap_entries: Vec<MailmapEntry>,
     ) -> Self {
         let total_commits = commits.len();
-        let earliest = commits.iter().map(|c| c.timestamp).min().unwrap_or(0);
-        let latest = commits.iter().map(|c| c.timestamp).max().unwrap_or(0);
+        let (earliest, latest) = commits.iter().fold(
+            (i64::MAX, i64::MIN),
+            |(lo, hi), c| (lo.min(c.timestamp), hi.max(c.timestamp)),
+        );
+        let earliest = if total_commits == 0 { 0 } else { earliest };
+        let latest = if total_commits == 0 { 0 } else { latest };
 
         let mut app = Self {
             authors: Vec::new(),
@@ -224,12 +259,16 @@ impl App {
             has_ownership: false,
             theme: Theme::Normal,
             show_theme_picker: true,
+            questionnaire: None,
             detail_group_id: None,
             sorted_indices: Vec::new(),
             graph_cache: RefCell::new(None),
             detail_cache: RefCell::new(None),
             commits,
             groups,
+            identity_map,
+            identity_map_path,
+            mailmap_entries,
             ownership_per_group: Vec::new(),
             ownership_total: 0,
             earliest,
@@ -237,6 +276,10 @@ impl App {
         };
         app.recompute();
         app
+    }
+
+    pub fn groups(&self) -> &[IdentityGroup] {
+        &self.groups
     }
 
     pub fn commits(&self) -> &[Commit] {
@@ -276,13 +319,7 @@ impl App {
             let author_stats = aggregate_group(gid, data, &self.groups[gid].display_name);
             total += author_stats.commits;
 
-            let ownership_lines = self.ownership_per_group.get(gid).copied().unwrap_or(0);
-            let ownership_pct = if self.ownership_total > 0 {
-                ownership_lines as f64 / self.ownership_total as f64 * 100.0
-            } else {
-                0.0
-            };
-
+            let (ownership_lines, ownership_pct) = self.ownership_for_gid(gid);
             authors.push(AuthorStats {
                 ownership_lines,
                 ownership_pct,
@@ -296,47 +333,88 @@ impl App {
     }
 
     pub fn time_bounds(&self) -> (i64, i64) {
+        self.bounds_for_offset(self.time_offset)
+    }
+
+    pub fn time_label(&self) -> String {
+        self.label_for_offset(self.time_offset)
+    }
+
+    fn label_for_offset(&self, offset: i32) -> String {
+        match self.time_mode {
+            TimeMode::All => "All time".to_string(),
+            TimeMode::Year => {
+                let year = ts_year(self.latest) + offset;
+                format!("{}", year)
+            }
+            TimeMode::Quarter => {
+                let dt = ts_to_dt(self.latest);
+                let ref_q_start = ((dt.month() - 1) / 3) * 3 + 1;
+                let (y, m) = offset_month(dt.year(), ref_q_start, offset * 3);
+                let q = (m - 1) / 3 + 1;
+                format!("{} Q{}", y, q)
+            }
+            TimeMode::Month => {
+                let dt = ts_to_dt(self.latest);
+                let (y, m) = offset_month(dt.year(), dt.month(), offset);
+                format!("{} {}", MONTHS[(m - 1) as usize], y)
+            }
+        }
+    }
+
+    fn bounds_for_offset(&self, offset: i32) -> (i64, i64) {
         match self.time_mode {
             TimeMode::All => (0, i64::MAX),
             TimeMode::Year => {
-                let ref_year = ts_year(self.latest);
-                let year = ref_year + self.time_offset;
+                let year = ts_year(self.latest) + offset;
                 (month_ts(year, 1), month_ts(year + 1, 1))
             }
             TimeMode::Quarter => {
                 let dt = ts_to_dt(self.latest);
                 let ref_q_start = ((dt.month() - 1) / 3) * 3 + 1;
-                let (y, m) = offset_month(dt.year(), ref_q_start, self.time_offset * 3);
+                let (y, m) = offset_month(dt.year(), ref_q_start, offset * 3);
                 let (ny, nm) = offset_month(y, m, 3);
                 (month_ts(y, m), month_ts(ny, nm))
             }
             TimeMode::Month => {
                 let dt = ts_to_dt(self.latest);
-                let (y, m) = offset_month(dt.year(), dt.month(), self.time_offset);
+                let (y, m) = offset_month(dt.year(), dt.month(), offset);
                 let (ny, nm) = offset_month(y, m, 1);
                 (month_ts(y, m), month_ts(ny, nm))
             }
         }
     }
 
-    pub fn time_label(&self) -> String {
+    fn short_label_for_offset(&self, offset: i32) -> String {
         match self.time_mode {
-            TimeMode::All => "All time".to_string(),
+            TimeMode::All => String::new(),
             TimeMode::Year => {
-                let year = ts_year(self.latest) + self.time_offset;
+                let year = ts_year(self.latest) + offset;
                 format!("{}", year)
             }
             TimeMode::Quarter => {
                 let dt = ts_to_dt(self.latest);
                 let ref_q_start = ((dt.month() - 1) / 3) * 3 + 1;
-                let (y, m) = offset_month(dt.year(), ref_q_start, self.time_offset * 3);
+                let (y, m) = offset_month(dt.year(), ref_q_start, offset * 3);
                 let q = (m - 1) / 3 + 1;
-                format!("{} Q{}", y, q)
+                if m == 1 {
+                    format!("{}Q{}", y, q)
+                } else {
+                    format!("Q{}", q)
+                }
             }
             TimeMode::Month => {
                 let dt = ts_to_dt(self.latest);
-                let (y, m) = offset_month(dt.year(), dt.month(), self.time_offset);
-                format!("{} {}", MONTHS[(m - 1) as usize], y)
+                let (y, m) = offset_month(dt.year(), dt.month(), offset);
+                let show_year = m == 1 || {
+                    let (py, _) = offset_month(dt.year(), dt.month(), offset - 1);
+                    y != py
+                };
+                if show_year {
+                    format!("{}{}", MONTHS[(m - 1) as usize], y % 100)
+                } else {
+                    MONTHS[(m - 1) as usize].to_string()
+                }
             }
         }
     }
@@ -363,8 +441,6 @@ impl App {
     pub fn overall_time_range(&self) -> (i64, i64) {
         (self.earliest, self.latest)
     }
-
-
 
     fn resort(&mut self) {
         self.sorted_indices = (0..self.authors.len()).collect();
@@ -415,13 +491,18 @@ impl App {
         self.recompute();
     }
 
-    fn empty_author(&self, gid: usize) -> AuthorStats {
-        let ownership_lines = self.ownership_per_group.get(gid).copied().unwrap_or(0);
-        let ownership_pct = if self.ownership_total > 0 {
-            ownership_lines as f64 / self.ownership_total as f64 * 100.0
+    fn ownership_for_gid(&self, gid: usize) -> (usize, f64) {
+        let lines = self.ownership_per_group.get(gid).copied().unwrap_or(0);
+        let pct = if self.ownership_total > 0 {
+            lines as f64 / self.ownership_total as f64 * 100.0
         } else {
             0.0
         };
+        (lines, pct)
+    }
+
+    fn empty_author(&self, gid: usize) -> AuthorStats {
+        let (ownership_lines, ownership_pct) = self.ownership_for_gid(gid);
         AuthorStats {
             display_name: self.groups[gid].display_name.clone(),
             group_id: gid,
@@ -467,6 +548,8 @@ impl App {
             .cloned()
             .unwrap_or_else(|| self.empty_author(gid));
 
+        let aliases = self.groups[gid].aliases.clone();
+
         let (prev_name, next_name) = match self.sorted_authors().position(|a| a.group_id == gid) {
             Some(pos) => {
                 let prev = pos
@@ -510,11 +593,9 @@ impl App {
                 activity[dow][hour] += 1;
             }
 
-            let lines_per_file = if entry.files_changed > 0 {
-                (entry.lines_added + entry.lines_removed) / entry.files_changed.max(1)
-            } else {
-                0
-            };
+            let lines_per_file = (entry.lines_added + entry.lines_removed)
+                .checked_div(entry.files_changed)
+                .unwrap_or(0);
             for f in &entry.added_file_names {
                 added_files.push(FileEvent {
                     path: f.clone(),
@@ -537,18 +618,86 @@ impl App {
 
         added_files.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.lines.cmp(&a.lines)));
         deleted_files.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.lines.cmp(&a.lines)));
+        added_files.dedup_by(|a, b| a.path == b.path);
+        deleted_files.dedup_by(|a, b| a.path == b.path);
         added_files.truncate(10);
         deleted_files.truncate(10);
 
+        let trend = self.compute_trend(gid);
+
         Some(DetailData {
             author,
+            aliases,
             prev_name,
             next_name,
             top_files,
             activity,
             recent_added: added_files,
             recent_deleted: deleted_files,
+            trend,
         })
+    }
+
+    fn compute_trend(&self, gid: usize) -> Vec<TrendPoint> {
+        if self.time_mode == TimeMode::All {
+            return Vec::new();
+        }
+
+        let periods: Vec<(i64, i64, String, bool)> = (-SURROUND_PERIODS..=SURROUND_PERIODS)
+            .filter_map(|delta| {
+                let virtual_offset = self.time_offset + delta;
+                let (s, e) = self.bounds_for_offset(virtual_offset);
+                if e <= self.earliest || s >= self.latest + SECONDS_PER_DAY {
+                    return None;
+                }
+                let label = self.short_label_for_offset(virtual_offset);
+                Some((s, e, label, delta == 0))
+            })
+            .collect();
+
+        let mut author_commits: Vec<(i64, usize, usize)> = self
+            .commits
+            .iter()
+            .filter(|c| c.group_id == gid)
+            .map(|c| (c.timestamp, c.lines_added + c.lines_removed, c.files_changed))
+            .collect();
+        author_commits.sort_by_key(|&(ts, _, _)| ts);
+
+        periods
+            .iter()
+            .map(|(start, end, label, is_current)| {
+                let mut sess_lines = 0usize;
+                let mut sess_files = 0usize;
+                let mut sess_last_ts = 0i64;
+                let mut total = 0u64;
+                let mut first = true;
+
+                for &(ts, lines, files) in &author_commits {
+                    if ts < *start || ts >= *end {
+                        continue;
+                    }
+                    if !first && ts - sess_last_ts > SESSION_GAP_SECS && sess_lines + sess_files > 0
+                    {
+                        total += (session_value(sess_lines, sess_files) * 10.0) as u64;
+                        sess_lines = 0;
+                        sess_files = 0;
+                    }
+                    first = false;
+                    sess_lines += lines;
+                    sess_files += files;
+                    sess_last_ts = ts;
+                }
+                if sess_lines + sess_files > 0 {
+                    total += (session_value(sess_lines, sess_files) * 10.0) as u64;
+                }
+
+                TrendPoint {
+                    label: label.clone(),
+                    value: total,
+                    is_current: *is_current,
+                }
+            })
+            .collect()
     }
 
     fn detail_navigate(&mut self, delta: i32) {
@@ -580,6 +729,47 @@ impl App {
         }
     }
 
+    fn start_questionnaire(&mut self) {
+        let candidates = crate::questionnaire::find_candidates(&self.groups, &self.identity_map);
+        if candidates.is_empty() {
+            return;
+        }
+        self.questionnaire = Some(QuestionnaireState {
+            candidates: candidates
+                .into_iter()
+                .map(|(a, b)| QuestionnaireCandidate {
+                    group_a: a,
+                    group_b: b,
+                })
+                .collect(),
+            current: 0,
+            changed: false,
+            last_action: None,
+        });
+    }
+
+    fn finish_questionnaire(&mut self) {
+        let changed = self.questionnaire.as_ref().is_some_and(|q| q.changed);
+        self.questionnaire = None;
+
+        if changed {
+            let _ = self.identity_map.save(&self.identity_map_path);
+            let (new_groups, assignments) =
+                crate::identity::merge(&self.commits, &self.identity_map, &self.mailmap_entries);
+            for (commit, &gid) in self.commits.iter_mut().zip(assignments.iter()) {
+                commit.group_id = gid;
+            }
+            self.total_authors = new_groups.len();
+            self.groups = new_groups;
+            self.detail_group_id = None;
+            self.selected = 0;
+            self.ownership_per_group.clear();
+            self.ownership_total = 0;
+            self.has_ownership = false;
+            self.recompute();
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         if self.show_theme_picker {
             match key.code {
@@ -591,11 +781,18 @@ impl App {
                         Theme::Readable => Theme::Normal,
                     };
                 }
-                KeyCode::Enter | KeyCode::Char(' ') => self.show_theme_picker = false,
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    self.show_theme_picker = false;
+                    self.start_questionnaire();
+                }
                 KeyCode::Esc | KeyCode::Char('q') => return true,
                 _ => {}
             }
             return false;
+        }
+
+        if self.questionnaire.is_some() {
+            return self.handle_questionnaire_key(key);
         }
 
         if self.view_mode == ViewMode::Detail {
@@ -626,10 +823,10 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.selected + 1 < self.authors.len() {
-                    self.selected += 1;
-                }
+            KeyCode::Down | KeyCode::Char('j')
+                if self.selected + 1 < self.authors.len() =>
+            {
+                self.selected += 1;
             }
             KeyCode::Home => self.selected = 0,
             KeyCode::End | KeyCode::Char('G') => {
@@ -644,6 +841,60 @@ impl App {
             }
             _ => {}
         }
+        false
+    }
+
+    fn handle_questionnaire_key(&mut self, key: KeyEvent) -> bool {
+        let q = self.questionnaire.as_ref().unwrap();
+        let cand = &q.candidates[q.current];
+        let ga = cand.group_a;
+        let gb = cand.group_b;
+
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.identity_map
+                    .add_merge(&self.groups[ga].aliases, &self.groups[gb].aliases);
+                let q = self.questionnaire.as_mut().unwrap();
+                q.changed = true;
+                q.last_action = Some("Merged");
+                q.current += 1;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.identity_map
+                    .add_reject(&self.groups[ga].aliases, &self.groups[gb].aliases);
+                let q = self.questionnaire.as_mut().unwrap();
+                q.changed = true;
+                q.last_action = Some("Rejected");
+                q.current += 1;
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                self.identity_map
+                    .add_unsure(&self.groups[ga].aliases, &self.groups[gb].aliases);
+                let q = self.questionnaire.as_mut().unwrap();
+                q.changed = true;
+                q.last_action = Some("Unsure");
+                q.current += 1;
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                let q = self.questionnaire.as_mut().unwrap();
+                q.last_action = Some("Skipped");
+                q.current += 1;
+            }
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.finish_questionnaire();
+                return false;
+            }
+            _ => {}
+        }
+
+        if self
+            .questionnaire
+            .as_ref()
+            .is_some_and(|q| q.current >= q.candidates.len())
+        {
+            self.finish_questionnaire();
+        }
+
         false
     }
 
@@ -894,14 +1145,20 @@ fn weekly_iter(start: i64) -> impl Iterator<Item = (i64, String)> {
 const SESSION_GAP_SECS: i64 = 30 * 60;
 const GRAPH_TOP_N: usize = 8;
 const DETAIL_SCROLL_MAX: usize = 200;
+const SURROUND_PERIODS: i32 = 4;
 
 enum ChangeKind {
     Feature,
     Refactor,
     Trivial,
+    Merge,
 }
 
 fn classify_commit(c: &Commit) -> ChangeKind {
+    if c.is_merge {
+        return ChangeKind::Merge;
+    }
+
     let total_lines = c.lines_added + c.lines_removed;
     let ws_total = c.whitespace_added + c.whitespace_removed;
     let is_whitespace_only = total_lines > 0 && ws_total >= total_lines;
@@ -940,6 +1197,7 @@ fn aggregate_group(gid: usize, sorted: &[&Commit], display_name: &str) -> Author
             ChangeKind::Feature => change_types.feature += 1,
             ChangeKind::Refactor => change_types.refactor += 1,
             ChangeKind::Trivial => change_types.trivial += 1,
+            ChangeKind::Merge => change_types.merge += 1,
         }
     }
 

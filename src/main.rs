@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 mod app;
 mod cache;
+mod db;
 mod export;
 mod fmt;
 mod git;
@@ -12,15 +13,17 @@ mod identity_map;
 mod mailmap;
 mod ownership;
 mod questionnaire;
+mod remote;
+mod storage;
 mod ui;
 mod util;
 
 #[derive(Parser)]
 #[command(name = "gild", about = "Interactive git contribution analyzer")]
 struct Cli {
-    /// Path to git repository
+    /// Path to git repository (local path or remote URL)
     #[arg(default_value = ".")]
-    path: PathBuf,
+    path: String,
 
     /// Branch to analyze
     #[arg(short, long)]
@@ -34,10 +37,6 @@ struct Cli {
     #[arg(long)]
     print: bool,
 
-    /// Skip identity questionnaire
-    #[arg(long)]
-    no_questions: bool,
-
     /// Skip code ownership analysis
     #[arg(long)]
     no_ownership: bool,
@@ -49,10 +48,6 @@ struct Cli {
     /// Output file for export (default: stdout)
     #[arg(short = 'o', long, value_name = "FILE")]
     output: Option<PathBuf>,
-
-    /// Force questionnaire even without TTY (for testing)
-    #[arg(long, hide = true)]
-    force_questions: bool,
 }
 
 fn clear_progress() {
@@ -62,12 +57,29 @@ fn clear_progress() {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let path = cli
-        .path
-        .canonicalize()
-        .unwrap_or_else(|_| cli.path.clone());
+    let path = if remote::is_remote_url(&cli.path) {
+        remote::ensure_repo(&cli.path)?
+    } else {
+        let p = PathBuf::from(&cli.path);
+        p.canonicalize().unwrap_or(p)
+    };
 
-    let mut commit_cache = cache::Cache::load(&path.join(".git"));
+    let repo_key = storage::resolve_repo_key(&path)?;
+    std::fs::create_dir_all(storage::repo_data_dir(&repo_key))?;
+
+    let map_path = storage::identities_path(&repo_key);
+    let legacy_gild_dir = path.join(".git/gild");
+    let legacy_id_path = legacy_gild_dir.join("identities.toml");
+    if !map_path.exists() && legacy_id_path.exists() {
+        let _ = std::fs::copy(&legacy_id_path, &map_path);
+    }
+    for name in &["cache.json", "ownership.json", "identities.toml"] {
+        let _ = std::fs::remove_file(legacy_gild_dir.join(name));
+    }
+    let _ = std::fs::remove_dir(&legacy_gild_dir);
+
+    let db = db::Database::open(&storage::db_path(&repo_key))?;
+    let mut commit_cache = cache::Cache::load(&db)?;
 
     let (info, repo, mut commits) = git::load_commits(
         &path,
@@ -97,7 +109,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    commit_cache.save(&info.git_dir)?;
+    commit_cache.save(&db)?;
 
     let mailmap_entries = mailmap::load(&path);
     if !mailmap_entries.is_empty() {
@@ -107,50 +119,30 @@ fn main() -> Result<()> {
         );
     }
 
-    let map_path = cache::identities_path(&info.git_dir);
-    let mut identity_map = identity_map::IdentityMap::load(&map_path);
+    let identity_map = identity_map::IdentityMap::load(&map_path);
 
-    let initial_merge = identity::merge(&commits, &identity_map, &mailmap_entries);
-
-    let identity_changed = if !cli.no_questions {
-        let changed = questionnaire::run(
-            &initial_merge.0,
-            &mut identity_map,
-            &map_path,
-            cli.force_questions,
-        );
-        if changed {
-            eprintln!(
-                "  Identity map: \x1b[90m{}\x1b[0m",
-                map_path.display()
-            );
-        }
-        changed
-    } else {
-        false
-    };
-
-    let (groups, assignments) = if identity_changed {
-        identity::merge(&commits, &identity_map, &mailmap_entries)
-    } else {
-        initial_merge
-    };
+    let (groups, assignments) = identity::merge(&commits, &identity_map, &mailmap_entries);
     for (commit, &gid) in commits.iter_mut().zip(assignments.iter()) {
         commit.group_id = gid;
     }
 
-    let num_groups = groups.len();
-    let git_dir = info.git_dir.clone();
-    let mut app = app::App::new(commits, groups, info);
+    let mut app = app::App::new(
+        commits,
+        groups,
+        info,
+        identity_map,
+        map_path,
+        mailmap_entries,
+    );
 
     if !cli.no_ownership {
-        match ownership::compute(&repo, &git_dir, app.commits(), |done, total| {
+        match ownership::compute(&repo, &db, app.commits(), app.groups(), |done, total| {
             eprint!("\r  Ownership... {}/{} files", done, total);
         }) {
             Ok(data) => {
                 clear_progress();
                 let (per_group, mapped_total) =
-                    ownership::map_to_groups(&data, num_groups);
+                    ownership::map_to_groups(&data, app.groups());
                 app.set_ownership(per_group, mapped_total);
             }
             Err(e) => {

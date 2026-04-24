@@ -43,7 +43,7 @@ pub fn parse_identity(s: &str) -> Option<(String, String)> {
 
 impl IdentityMap {
     pub fn load(path: &Path) -> Self {
-        load_or_default(path, |s| toml::from_str::<Self>(s))
+        load_or_default(path, toml::from_str::<Self>)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {

@@ -1,4 +1,5 @@
-use crate::app::{App, FileEvent, SortMode, Theme, ViewMode};
+use crate::app::{App, FileEvent, SortMode, Theme, TrendPoint, ViewMode};
+use crate::identity_map::format_identity;
 use crate::fmt::{fmt_date, fmt_num};
 use anyhow::Result;
 use crossterm::event::{self, Event};
@@ -23,8 +24,6 @@ const REMOVED: Color = Color::Rgb(255, 85, 85);
 const HEADER_COLOR: Color = Color::Rgb(139, 233, 253);
 const DIM: Color = Color::Rgb(108, 118, 148);
 const BORDER_TEAL: Color = Color::Rgb(0x4a, 0x93, 0x8f);
-const BAR_FULL: Color = Color::Rgb(189, 147, 249);
-
 const ACTIVE_SORT: Color = Color::Rgb(80, 250, 123);
 const EMPTY_WEEKDAY: Color = Color::Rgb(255, 184, 108);
 
@@ -343,17 +342,21 @@ fn draw(frame: &mut ratatui::Frame, app: &App, table_state: &mut TableState) {
     }
 
     if app.theme == Theme::Readable {
-        force_dark_bg(frame);
+        apply_readable_theme(frame);
     }
 
     if app.show_theme_picker {
         draw_theme_picker(frame, app);
     }
+
+    if app.questionnaire.is_some() {
+        draw_questionnaire(frame, app);
+    }
 }
 
-const FORCED_BG: Color = Color::Rgb(0x28, 0x2a, 0x36);
+const FORCED_BG: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
 
-fn force_dark_bg(frame: &mut ratatui::Frame) {
+fn apply_readable_theme(frame: &mut ratatui::Frame) {
     let area = frame.area();
     let buf = frame.buffer_mut();
     for y in area.y..area.y + area.height {
@@ -362,8 +365,71 @@ fn force_dark_bg(frame: &mut ratatui::Frame) {
                 if cell.bg == Color::Reset {
                     cell.bg = FORCED_BG;
                 }
+                cell.fg = simplify_color(cell.fg);
             }
         }
+    }
+}
+
+fn simplify_color(c: Color) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => {
+            let lum = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
+
+            if lum < 25.0 {
+                return Color::Rgb(0x3a, 0x3a, 0x4e);
+            }
+
+            if r < 80 && g < 80 && b < 80 {
+                return Color::DarkGray;
+            }
+
+            if lum < 75.0 {
+                return Color::Gray;
+            }
+
+            let max = r.max(g).max(b);
+            let min = r.min(g).min(b);
+            let sat = if max == 0 {
+                0.0
+            } else {
+                (max - min) as f64 / max as f64
+            };
+
+            if sat < 0.2 {
+                if lum > 200.0 {
+                    return Color::White;
+                }
+                return Color::Gray;
+            }
+
+            if r > g && r > b {
+                if g > 180 {
+                    Color::Yellow
+                } else if g > 100 {
+                    Color::Rgb(0xff, 0xb0, 0x60)
+                } else {
+                    Color::LightRed
+                }
+            } else if g > r && g > b {
+                Color::LightGreen
+            } else if b > r && b > g {
+                if r > 160 {
+                    Color::Rgb(0xcc, 0xaa, 0xff)
+                } else {
+                    Color::LightCyan
+                }
+            } else if r > 200 && g > 200 {
+                Color::Yellow
+            } else if g > 200 && b > 200 {
+                Color::LightCyan
+            } else if r > 200 && b > 200 {
+                Color::LightMagenta
+            } else {
+                Color::White
+            }
+        }
+        _ => c,
     }
 }
 
@@ -380,19 +446,21 @@ fn draw_theme_picker(frame: &mut ratatui::Frame, app: &App) {
 
     frame.render_widget(Clear, popup);
 
-    let popup_bg = Color::Rgb(0x1e, 0x1f, 0x2e);
+    let popup_bg = Color::Rgb(0x1e, 0x1e, 0x2e);
     let highlight = Style::default()
-        .fg(ACTIVE_SORT)
+        .fg(Color::LightGreen)
         .add_modifier(Modifier::BOLD);
-    let muted = Style::default().fg(DIM);
+    let muted = Style::default().fg(Color::Gray);
 
     let block = Block::default()
         .title(Span::styled(
             " Theme ",
-            Style::default().fg(BAR_FULL).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER_TEAL))
+        .border_style(Style::default().fg(Color::Gray))
         .style(Style::default().bg(popup_bg));
 
     let normal_label = if app.theme == Theme::Normal {
@@ -408,7 +476,7 @@ fn draw_theme_picker(frame: &mut ratatui::Frame, app: &App) {
 
     let hint = match app.theme {
         Theme::Normal => "  uses your terminal's background",
-        Theme::Readable => "  forces a dark background for color accuracy",
+        Theme::Readable => "  dark background + simplified colors",
     };
 
     let text = vec![
@@ -440,6 +508,124 @@ fn draw_theme_picker(frame: &mut ratatui::Frame, app: &App) {
             muted,
         )),
     ];
+
+    let paragraph = Paragraph::new(text).block(block);
+    frame.render_widget(paragraph, popup);
+}
+
+fn draw_questionnaire(frame: &mut ratatui::Frame, app: &App) {
+    let q = match &app.questionnaire {
+        Some(q) => q,
+        None => return,
+    };
+
+    let cand = &q.candidates[q.current];
+    let groups = app.groups();
+    let group_a = &groups[cand.group_a];
+    let group_b = &groups[cand.group_b];
+
+    let a_lines = group_a.aliases.len();
+    let b_lines = group_b.aliases.len();
+    let content_h = a_lines + b_lines + 7;
+    let popup_h = (content_h as u16 + 2).min(frame.area().height.saturating_sub(2));
+    let popup_w = 64u16.min(frame.area().width.saturating_sub(4));
+    if popup_w < 30 || popup_h < 8 {
+        return;
+    }
+
+    let x = (frame.area().width - popup_w) / 2;
+    let y = (frame.area().height - popup_h) / 3;
+    let popup = Rect::new(x, y, popup_w, popup_h);
+
+    frame.render_widget(Clear, popup);
+
+    let popup_bg = Color::Rgb(0x1e, 0x1e, 0x2e);
+    let block = Block::default()
+        .title(Span::styled(
+            " Identity Match ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Gray))
+        .style(Style::default().bg(popup_bg));
+
+    let muted = Style::default().fg(Color::Gray);
+    let max_w = popup_w as usize - 4;
+
+    let mut text: Vec<Line> = Vec::new();
+
+    text.push(Line::from(Span::styled(
+        format!(
+            "  ({}/{}) Same person?",
+            q.current + 1,
+            q.candidates.len()
+        ),
+        muted,
+    )));
+    text.push(Line::from(""));
+
+    for (name, email) in &group_a.aliases {
+        let ident = format_identity(name, email);
+        let display = if ident.len() > max_w {
+            format!("{}\u{2026}", &ident[..max_w - 1])
+        } else {
+            ident
+        };
+        text.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(display, Style::default().fg(HEADER_COLOR)),
+        ]));
+    }
+
+    text.push(Line::from(Span::styled("    vs", muted)));
+
+    for (name, email) in &group_b.aliases {
+        let ident = format_identity(name, email);
+        let display = if ident.len() > max_w {
+            format!("{}\u{2026}", &ident[..max_w - 1])
+        } else {
+            ident
+        };
+        text.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(display, Style::default().fg(GOLD)),
+        ]));
+    }
+
+    text.push(Line::from(""));
+
+    if let Some(action) = q.last_action {
+        let color = match action {
+            "Merged" => Color::LightGreen,
+            "Rejected" => Color::LightRed,
+            "Unsure" => Color::Yellow,
+            _ => Color::Gray,
+        };
+        text.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("\u{2190} {}", action),
+                Style::default().fg(color),
+            ),
+        ]));
+    } else {
+        text.push(Line::from(""));
+    }
+
+    text.push(Line::from(vec![
+        Span::styled("  [y]", Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
+        Span::styled("es  ", muted),
+        Span::styled("[n]", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)),
+        Span::styled("o  ", muted),
+        Span::styled("[d]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("on't know  ", muted),
+        Span::styled("[s]", Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
+        Span::styled("kip  ", muted),
+        Span::styled("[q]", Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
+        Span::styled("uit", muted),
+    ]));
 
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup);
@@ -683,10 +869,12 @@ fn draw_detail_view(frame: &mut ratatui::Frame, app: &App) {
         None => return,
     };
 
+    let has_aliases = !detail.aliases.is_empty();
+    let header_height = if has_aliases { 7 } else { 6 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
+            Constraint::Length(header_height),
             Constraint::Min(10),
             Constraint::Length(1),
         ])
@@ -704,7 +892,7 @@ fn draw_detail_view(frame: &mut ratatui::Frame, app: &App) {
     };
 
     let ct = &a.change_types;
-    let ct_total = ct.feature + ct.refactor + ct.trivial;
+    let ct_total = ct.feature + ct.refactor + ct.trivial + ct.merge;
     let ws_pct = if a.lines_added + a.lines_removed > 0 {
         ct.whitespace_lines as f64 / (a.lines_added + a.lines_removed) as f64 * 100.0
     } else {
@@ -742,7 +930,47 @@ fn draw_detail_view(frame: &mut ratatui::Frame, app: &App) {
         ])
     };
 
-    let mut header_text = vec![name_line, stats_line];
+    let mut header_text = vec![name_line];
+
+    if !detail.aliases.is_empty() {
+        let mut emails: Vec<&str> = Vec::new();
+        let mut other_names: Vec<&str> = Vec::new();
+        for (name, email) in &detail.aliases {
+            if !emails.contains(&email.as_str()) {
+                emails.push(email);
+            }
+            if name != &a.display_name && !other_names.contains(&name.as_str()) {
+                other_names.push(name);
+            }
+        }
+
+        let mut spans: Vec<Span> = Vec::new();
+        let max_show = 3;
+        for (i, email) in emails.iter().take(max_show).enumerate() {
+            if i > 0 {
+                spans.push(dim(", "));
+            }
+            spans.push(fg((*email).to_string(), Color::Rgb(189, 147, 249)));
+        }
+        if emails.len() > max_show {
+            spans.push(dim(format!(" +{}", emails.len() - max_show)));
+        }
+        if !other_names.is_empty() {
+            spans.push(dim("  aka "));
+            for (i, name) in other_names.iter().take(max_show).enumerate() {
+                if i > 0 {
+                    spans.push(dim(", "));
+                }
+                spans.push(fg((*name).to_string(), SILVER));
+            }
+            if other_names.len() > max_show {
+                spans.push(dim(format!(" +{}", other_names.len() - max_show)));
+            }
+        }
+        header_text.push(Line::from(spans));
+    }
+
+    header_text.push(stats_line);
     if ct_total > 0 {
         let mut spans = vec![
             fg(format!("{} feature", ct.feature), ADDED),
@@ -751,6 +979,10 @@ fn draw_detail_view(frame: &mut ratatui::Frame, app: &App) {
             dim("  "),
             dim(format!("{} trivial", ct.trivial)),
         ];
+        if ct.merge > 0 {
+            spans.push(dim("  "));
+            spans.push(fg(format!("{} merge", ct.merge), Color::Rgb(189, 147, 249)));
+        }
         if ct.new_files > 0 {
             spans.push(fg(format!("  +{} new files", ct.new_files), ADDED));
         }
@@ -797,20 +1029,48 @@ fn draw_detail_view(frame: &mut ratatui::Frame, app: &App) {
     }
 
     let content_area = chunks[1];
-    let content_rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(content_area);
+    let has_trend = detail.trend.len() >= 2;
 
+    let added_count = detail.recent_added.len();
+    let deleted_count = detail.recent_deleted.len();
+    let bottom_content = added_count.max(deleted_count);
+    let bottom_h = if bottom_content == 0 {
+        3
+    } else {
+        (bottom_content as u16 + 2).min(8)
+    };
+
+    let content_rows = if has_trend {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(10),
+                Constraint::Min(10),
+                Constraint::Length(bottom_h),
+            ])
+            .split(content_area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(10), Constraint::Length(bottom_h)])
+            .split(content_area)
+    };
+
+    if has_trend {
+        draw_detail_trend(frame, &detail.trend, content_rows[0]);
+    }
+
+    let panels_idx = if has_trend { 1 } else { 0 };
     let top_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(content_rows[0]);
+        .split(content_rows[panels_idx]);
 
+    let bottom_idx = if has_trend { 2 } else { 1 };
     let bottom_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(content_rows[1]);
+        .split(content_rows[bottom_idx]);
 
     draw_detail_files(frame, &detail.top_files, app.detail_scroll, top_cols[0]);
     draw_detail_activity(frame, &detail.activity, top_cols[1]);
@@ -971,6 +1231,126 @@ fn draw_detail_activity(frame: &mut ratatui::Frame, activity: &[[usize; 24]; 7],
     frame.render_widget(paragraph, inner);
 }
 
+fn draw_detail_trend(frame: &mut ratatui::Frame, trend: &[TrendPoint], area: Rect) {
+    let block = titled_block(" Trend ", HEADER_COLOR);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if trend.is_empty() {
+        return;
+    }
+
+    let max_val = trend.iter().map(|p| p.value).max().unwrap_or(1).max(1);
+    let bar_height = inner.height.saturating_sub(2) as usize;
+    if bar_height == 0 || inner.width < 3 {
+        return;
+    }
+
+    let n = trend.len();
+    let avail = inner.width as usize;
+    let bar_w = ((avail - 1) / n).max(1).min(10);
+    let gap = if bar_w >= 3 { 1 } else { 0 };
+    let total_w = n * bar_w + (n - 1) * gap;
+    let left_pad = (avail.saturating_sub(total_w)) / 2;
+
+    let fills: Vec<f64> = trend
+        .iter()
+        .map(|p| p.value as f64 / max_val as f64)
+        .collect();
+
+    let bar_tops: Vec<usize> = fills
+        .iter()
+        .map(|&f| {
+            let filled_rows = (f * bar_height as f64).round() as usize;
+            bar_height - filled_rows.min(bar_height)
+        })
+        .collect();
+
+    let mut buf_lines: Vec<Line> = Vec::new();
+
+    for row in 0..bar_height {
+        let threshold = (bar_height - row) as f64 / bar_height as f64;
+        let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(left_pad))];
+
+        for (i, point) in trend.iter().enumerate() {
+            let is_top_row = row == bar_tops[i] && fills[i] > 0.0;
+
+            if fills[i] >= threshold {
+                if is_top_row && bar_w >= 3 {
+                    let val_str = fmt_num(point.value as usize);
+                    let val_display = truncate(&val_str, bar_w);
+                    let vw = display_width(&val_display);
+                    let vpad = bar_w.saturating_sub(vw);
+                    let pl = vpad / 2;
+                    let pr = vpad - pl;
+                    let label = format!("{}{}{}", " ".repeat(pl), val_display, " ".repeat(pr));
+                    if point.is_current {
+                        spans.push(Span::styled(
+                            label,
+                            Style::default()
+                                .fg(Color::Rgb(0x28, 0x2a, 0x36))
+                                .bg(gradient_color(&HEAT_STOPS, fills[i].clamp(0.3, 1.0))),
+                        ));
+                    } else {
+                        spans.push(Span::styled(
+                            label,
+                            Style::default()
+                                .fg(Color::Rgb(0x28, 0x2a, 0x36))
+                                .bg(Color::Rgb(0x5a, 0x5e, 0x76)),
+                        ));
+                    }
+                } else if point.is_current {
+                    spans.push(fg(
+                        "\u{2588}".repeat(bar_w),
+                        gradient_color(&HEAT_STOPS, fills[i].clamp(0.3, 1.0)),
+                    ));
+                } else {
+                    spans.push(fg(
+                        "\u{2588}".repeat(bar_w),
+                        Color::Rgb(0x5a, 0x5e, 0x76),
+                    ));
+                }
+            } else {
+                spans.push(Span::raw(" ".repeat(bar_w)));
+            }
+            if gap > 0 && i + 1 < n {
+                spans.push(Span::raw(" ".repeat(gap)));
+            }
+        }
+
+        buf_lines.push(Line::from(spans));
+    }
+
+    let mut label_spans: Vec<Span> = vec![Span::raw(" ".repeat(left_pad))];
+    for (i, point) in trend.iter().enumerate() {
+        let lbl = truncate(&point.label, bar_w);
+        let lw = display_width(&lbl);
+        let pad_r = bar_w.saturating_sub(lw);
+        let pl = pad_r / 2;
+        let pr = pad_r - pl;
+        if point.is_current {
+            label_spans.push(fg(
+                format!("{}{}{}", " ".repeat(pl), lbl, " ".repeat(pr)),
+                GOLD,
+            ));
+        } else {
+            label_spans.push(dim(format!(
+                "{}{}{}",
+                " ".repeat(pl),
+                lbl,
+                " ".repeat(pr)
+            )));
+        }
+        if gap > 0 && i + 1 < n {
+            label_spans.push(Span::raw(" ".repeat(gap)));
+        }
+    }
+    buf_lines.push(Line::from(label_spans));
+
+    let paragraph = Paragraph::new(buf_lines);
+    frame.render_widget(paragraph, inner);
+}
+
 fn draw_file_events(
     frame: &mut ratatui::Frame,
     events: &[FileEvent],
@@ -1120,19 +1500,18 @@ fn truncate_left(s: &str, max_width: usize) -> String {
     if w <= max_width {
         return s.to_string();
     }
-    let mut chars: Vec<char> = Vec::new();
-    let mut current_width = 1;
-    for c in s.chars().rev() {
+    let mut current_width = 1; // reserve 1 for the ellipsis
+    let mut split_byte = s.len();
+    for (byte_pos, c) in s.char_indices().rev() {
         let cw = char_display_width(c);
         if current_width + cw > max_width {
             break;
         }
-        chars.push(c);
         current_width += cw;
+        split_byte = byte_pos;
     }
-    chars.reverse();
     let mut result = String::from("\u{2026}");
-    result.extend(chars);
+    result.push_str(&s[split_byte..]);
     result
 }
 
