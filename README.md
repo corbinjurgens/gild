@@ -17,16 +17,16 @@ Fair impact scoring, identity deduplication, code ownership tracking.
 ### From source (recommended)
 
 ```sh
-git clone https://github.com/corbinjurgens/git-pulse.git
-cd git-pulse
+git clone https://github.com/corbinjurgens/gild.git
+cd gild
 cargo install --path .
 ```
 
 ### Build without installing
 
 ```sh
-git clone https://github.com/corbinjurgens/git-pulse.git
-cd git-pulse
+git clone https://github.com/corbinjurgens/gild.git
+cd gild
 cargo build --release
 ./target/release/gild --help
 ```
