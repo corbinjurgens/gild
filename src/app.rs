@@ -1,3 +1,4 @@
+use crate::db::{Database, FILE_KIND_ADDED, FILE_KIND_DELETED, FILE_KIND_TOUCHED};
 use crate::fmt::{MONTHS, SECONDS_PER_DAY, SECONDS_PER_WEEK};
 use crate::git::{Commit, RepoInfo};
 use crate::identity::IdentityGroup;
@@ -5,8 +6,8 @@ use crate::identity_map::IdentityMap;
 use crate::mailmap::MailmapEntry;
 use chrono::{DateTime, Datelike, Timelike};
 use crossterm::event::{KeyCode, KeyEvent};
+use rusqlite::params_from_iter;
 use std::cell::{Ref, RefCell};
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -41,6 +42,23 @@ pub enum ViewMode {
     Table,
     Graph,
     Detail,
+    Files,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum FileSortMode {
+    Commits,
+    Authors,
+    Churn,
+    Coupling,
+}
+
+pub struct FileRow {
+    pub path: String,
+    pub commit_count: u32,
+    pub unique_authors: Option<u32>,
+    pub churn_score: Option<f64>,
+    pub top_coupled: Option<(String, f64)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -63,7 +81,6 @@ pub struct GraphData {
 pub struct FileEvent {
     pub path: String,
     pub timestamp: i64,
-    pub lines: usize,
 }
 
 pub struct TrendPoint {
@@ -209,6 +226,10 @@ pub struct App {
     pub total_authors: usize,
     pub filtered_commits: usize,
     pub has_ownership: bool,
+    pub has_files_view: bool,
+    pub file_rows: Vec<FileRow>,
+    pub file_sort: FileSortMode,
+    pub file_selected: usize,
     pub theme: Theme,
     pub show_theme_picker: bool,
     pub questionnaire: Option<QuestionnaireState>,
@@ -225,6 +246,7 @@ pub struct App {
     ownership_total: usize,
     earliest: i64,
     latest: i64,
+    db: Database,
 }
 
 impl App {
@@ -235,6 +257,7 @@ impl App {
         identity_map: IdentityMap,
         identity_map_path: PathBuf,
         mailmap_entries: Vec<MailmapEntry>,
+        db: Database,
     ) -> Self {
         let total_commits = commits.len();
         let (earliest, latest) = commits.iter().fold(
@@ -257,8 +280,12 @@ impl App {
             total_authors: groups.len(),
             filtered_commits: total_commits,
             has_ownership: false,
+            has_files_view: false,
+            file_rows: Vec::new(),
+            file_sort: FileSortMode::Commits,
+            file_selected: 0,
             theme: Theme::Normal,
-            show_theme_picker: true,
+            show_theme_picker: false,
             questionnaire: None,
             detail_group_id: None,
             sorted_indices: Vec::new(),
@@ -273,6 +300,7 @@ impl App {
             ownership_total: 0,
             earliest,
             latest,
+            db,
         };
         app.recompute();
         app
@@ -282,15 +310,53 @@ impl App {
         &self.groups
     }
 
-    pub fn commits(&self) -> &[Commit] {
-        &self.commits
-    }
-
     pub fn set_ownership(&mut self, per_group: Vec<usize>, total: usize) {
         self.ownership_per_group = per_group;
         self.ownership_total = total;
         self.has_ownership = total > 0;
         self.recompute();
+    }
+
+    pub fn set_file_data(&mut self, rows: Vec<FileRow>) {
+        self.file_rows = rows;
+        self.file_sort = FileSortMode::Commits;
+        self.file_selected = 0;
+        self.has_files_view = !self.file_rows.is_empty();
+        self.sort_file_rows();
+    }
+
+    fn sort_file_rows(&mut self) {
+        match self.file_sort {
+            FileSortMode::Commits => {
+                self.file_rows.sort_by(|a, b| b.commit_count.cmp(&a.commit_count));
+            }
+            FileSortMode::Authors => {
+                self.file_rows.sort_by(|a, b| {
+                    b.unique_authors.unwrap_or(0).cmp(&a.unique_authors.unwrap_or(0))
+                });
+            }
+            FileSortMode::Churn => {
+                self.file_rows.sort_by(|a, b| {
+                    b.churn_score.unwrap_or(0.0).partial_cmp(&a.churn_score.unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+            FileSortMode::Coupling => {
+                self.file_rows.sort_by(|a, b| {
+                    let sa = a.top_coupled.as_ref().map(|(_, s)| *s).unwrap_or(0.0);
+                    let sb = b.top_coupled.as_ref().map(|(_, s)| *s).unwrap_or(0.0);
+                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+        }
+    }
+
+    pub fn set_file_sort(&mut self, mode: FileSortMode) {
+        if self.file_sort != mode {
+            self.file_sort = mode;
+            self.file_selected = 0;
+            self.sort_file_rows();
+        }
     }
 
     fn recompute(&mut self) {
@@ -470,7 +536,7 @@ impl App {
         }
     }
 
-    fn set_time_mode(&mut self, mode: TimeMode) {
+    pub fn set_time_mode(&mut self, mode: TimeMode) {
         self.time_mode = mode;
         self.time_offset = 0;
         self.recompute();
@@ -568,12 +634,7 @@ impl App {
 
         let (start, end) = self.time_bounds();
 
-        let mut file_counts: HashMap<String, usize> = HashMap::new();
         let mut activity = [[0usize; 24]; 7];
-
-        let mut added_files: Vec<FileEvent> = Vec::new();
-        let mut deleted_files: Vec<FileEvent> = Vec::new();
-
         for entry in &self.commits {
             if entry.group_id != gid {
                 continue;
@@ -581,47 +642,16 @@ impl App {
             if entry.timestamp < start || entry.timestamp >= end {
                 continue;
             }
-
-            for f in &entry.files {
-                *file_counts.entry(f.clone()).or_insert(0) += 1;
-            }
-
             if let Some(dt) = DateTime::from_timestamp(entry.timestamp, 0) {
                 let local = dt.with_timezone(&chrono::Local);
                 let dow = local.weekday().num_days_from_monday() as usize;
                 let hour = local.hour() as usize;
                 activity[dow][hour] += 1;
             }
-
-            let lines_per_file = (entry.lines_added + entry.lines_removed)
-                .checked_div(entry.files_changed)
-                .unwrap_or(0);
-            for f in &entry.added_file_names {
-                added_files.push(FileEvent {
-                    path: f.clone(),
-                    timestamp: entry.timestamp,
-                    lines: lines_per_file,
-                });
-            }
-            for f in &entry.deleted_file_names {
-                deleted_files.push(FileEvent {
-                    path: f.clone(),
-                    timestamp: entry.timestamp,
-                    lines: lines_per_file,
-                });
-            }
         }
 
-        let mut top_files: Vec<(String, usize)> = file_counts.into_iter().collect();
-        top_files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        top_files.truncate(20);
-
-        added_files.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.lines.cmp(&a.lines)));
-        deleted_files.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.lines.cmp(&a.lines)));
-        added_files.dedup_by(|a, b| a.path == b.path);
-        deleted_files.dedup_by(|a, b| a.path == b.path);
-        added_files.truncate(10);
-        deleted_files.truncate(10);
+        let (top_files, recent_added, recent_deleted) =
+            self.query_group_files(gid, start, end).unwrap_or_default();
 
         let trend = self.compute_trend(gid);
 
@@ -632,10 +662,117 @@ impl App {
             next_name,
             top_files,
             activity,
-            recent_added: added_files,
-            recent_deleted: deleted_files,
+            recent_added,
+            recent_deleted,
             trend,
         })
+    }
+
+    /// Fetch per-file commit counts and recent add/delete events for a group.
+    ///
+    /// File paths are not kept in memory; each detail-view open issues three
+    /// short SQL queries scoped to the group's author emails and window.
+    fn query_group_files(
+        &self,
+        gid: usize,
+        start: i64,
+        end: i64,
+    ) -> rusqlite::Result<(Vec<(String, usize)>, Vec<FileEvent>, Vec<FileEvent>)> {
+        let mut emails: Vec<String> = self.groups[gid]
+            .aliases
+            .iter()
+            .map(|(_, e)| e.clone())
+            .collect();
+        emails.sort();
+        emails.dedup();
+        if emails.is_empty() {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+
+        // `?N` placeholders for emails start after the three fixed params
+        // (kind, start, end).
+        let email_placeholders = (0..emails.len())
+            .map(|i| format!("?{}", i + 4))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let top_files =
+            self.query_top_files(&emails, &email_placeholders, start, end)?;
+        let recent_added =
+            self.query_recent_events(FILE_KIND_ADDED, &emails, &email_placeholders, start, end)?;
+        let recent_deleted =
+            self.query_recent_events(FILE_KIND_DELETED, &emails, &email_placeholders, start, end)?;
+
+        Ok((top_files, recent_added, recent_deleted))
+    }
+
+    fn query_top_files(
+        &self,
+        emails: &[String],
+        email_placeholders: &str,
+        start: i64,
+        end: i64,
+    ) -> rusqlite::Result<Vec<(String, usize)>> {
+        let sql = format!(
+            "SELECT cf.file_path, COUNT(*) AS ct
+             FROM commit_files cf
+             JOIN commits c ON c.hash = cf.commit_hash
+             WHERE cf.kind = ?1 AND c.timestamp >= ?2 AND c.timestamp < ?3
+               AND c.author_email IN ({})
+             GROUP BY cf.file_path
+             ORDER BY ct DESC, cf.file_path ASC
+             LIMIT 20",
+            email_placeholders
+        );
+        let mut stmt = self.db.conn.prepare(&sql)?;
+        let args = bind_args(FILE_KIND_TOUCHED, start, end, emails);
+        let mut rows = stmt.query(params_from_iter(args.iter()))?;
+        let mut out = Vec::with_capacity(20);
+        while let Some(row) = rows.next()? {
+            out.push((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize));
+        }
+        Ok(out)
+    }
+
+    fn query_recent_events(
+        &self,
+        kind: i64,
+        emails: &[String],
+        email_placeholders: &str,
+        start: i64,
+        end: i64,
+    ) -> rusqlite::Result<Vec<FileEvent>> {
+        // Over-fetch then dedupe by path — matches the prior behavior of
+        // "most-recent N distinct files" without a correlated subquery.
+        let sql = format!(
+            "SELECT cf.file_path, c.timestamp
+             FROM commit_files cf
+             JOIN commits c ON c.hash = cf.commit_hash
+             WHERE cf.kind = ?1 AND c.timestamp >= ?2 AND c.timestamp < ?3
+               AND c.author_email IN ({})
+             ORDER BY c.timestamp DESC
+             LIMIT 200",
+            email_placeholders
+        );
+        let mut stmt = self.db.conn.prepare(&sql)?;
+        let args = bind_args(kind, start, end, emails);
+        let mut rows = stmt.query(params_from_iter(args.iter()))?;
+        let mut seen = std::collections::HashSet::<String>::new();
+        let mut out = Vec::with_capacity(10);
+        while let Some(row) = rows.next()? {
+            if out.len() >= 10 {
+                break;
+            }
+            let path: String = row.get(0)?;
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            out.push(FileEvent {
+                path,
+                timestamp: row.get(1)?,
+            });
+        }
+        Ok(out)
     }
 
     fn compute_trend(&self, gid: usize) -> Vec<TrendPoint> {
@@ -799,6 +936,10 @@ impl App {
             return self.handle_detail_key(key);
         }
 
+        if self.view_mode == ViewMode::Files {
+            return self.handle_files_key(key);
+        }
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return true,
             KeyCode::Char('c') => self.set_sort(SortMode::Commits),
@@ -814,8 +955,14 @@ impl App {
                 self.view_mode = match self.view_mode {
                     ViewMode::Table => ViewMode::Graph,
                     ViewMode::Graph => ViewMode::Table,
-                    ViewMode::Detail => ViewMode::Table,
+                    ViewMode::Detail | ViewMode::Files => ViewMode::Table,
                 };
+            }
+            KeyCode::Char('V') => {
+                if self.has_files_view {
+                    self.view_mode = ViewMode::Files;
+                    self.file_selected = 0;
+                }
             }
             KeyCode::Char('t') => self.set_time_mode(self.time_mode.next()),
             KeyCode::Left | KeyCode::Char('[') => self.time_navigate(-1),
@@ -924,6 +1071,32 @@ impl App {
                 self.detail_scroll = (self.detail_scroll + 5).min(DETAIL_SCROLL_MAX);
             }
             KeyCode::Home => self.detail_scroll = 0,
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_files_key(&mut self, key: KeyEvent) -> bool {
+        let count = self.file_rows.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('V') => {
+                self.view_mode = ViewMode::Table;
+            }
+            KeyCode::Char('q') => return true,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.file_selected = self.file_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.file_selected + 1 < count => {
+                self.file_selected += 1;
+            }
+            KeyCode::Home => self.file_selected = 0,
+            KeyCode::End | KeyCode::Char('G') => {
+                self.file_selected = count.saturating_sub(1);
+            }
+            KeyCode::Char('c') => self.set_file_sort(FileSortMode::Commits),
+            KeyCode::Char('a') => self.set_file_sort(FileSortMode::Authors),
+            KeyCode::Char('h') => self.set_file_sort(FileSortMode::Churn),
+            KeyCode::Char('p') => self.set_file_sort(FileSortMode::Coupling),
             _ => {}
         }
         false
@@ -1154,6 +1327,23 @@ enum ChangeKind {
     Merge,
 }
 
+fn bind_args(
+    kind: i64,
+    start: i64,
+    end: i64,
+    emails: &[String],
+) -> Vec<rusqlite::types::Value> {
+    use rusqlite::types::Value;
+    let mut args = Vec::with_capacity(3 + emails.len());
+    args.push(Value::Integer(kind));
+    args.push(Value::Integer(start));
+    args.push(Value::Integer(end));
+    for e in emails {
+        args.push(Value::Text(e.clone()));
+    }
+    args
+}
+
 fn classify_commit(c: &Commit) -> ChangeKind {
     if c.is_merge {
         return ChangeKind::Merge;
@@ -1162,7 +1352,7 @@ fn classify_commit(c: &Commit) -> ChangeKind {
     let total_lines = c.lines_added + c.lines_removed;
     let ws_total = c.whitespace_added + c.whitespace_removed;
     let is_whitespace_only = total_lines > 0 && ws_total >= total_lines;
-    let is_trivial = total_lines <= 5 && c.files.len() <= 1;
+    let is_trivial = total_lines <= 5 && c.files_changed <= 1;
 
     if is_whitespace_only || is_trivial {
         ChangeKind::Trivial
@@ -1189,7 +1379,7 @@ fn aggregate_group(gid: usize, sorted: &[&Commit], display_name: &str) -> Author
     for c in sorted {
         lines_added += c.lines_added;
         lines_removed += c.lines_removed;
-        files_changed += c.files.len();
+        files_changed += c.files_changed;
         change_types.whitespace_lines += c.whitespace_added + c.whitespace_removed;
         change_types.new_files += c.files_added;
         change_types.deleted_files += c.files_deleted;
@@ -1224,16 +1414,14 @@ fn compute_impact(sorted_commits: &[&Commit]) -> f64 {
 
     let mut total_lines = 0usize;
     let mut total_ws = 0usize;
-    let mut unique_files = std::collections::HashSet::new();
+    let mut total_files = 0usize;
     let mut sessions = 1usize;
     let mut last_ts = sorted_commits[0].timestamp;
 
     for c in sorted_commits {
         total_lines += c.lines_added + c.lines_removed;
         total_ws += c.whitespace_added + c.whitespace_removed;
-        for f in &c.files {
-            unique_files.insert(f.as_str());
-        }
+        total_files += c.files_changed;
         if c.timestamp - last_ts > SESSION_GAP_SECS {
             sessions += 1;
         }
@@ -1244,7 +1432,10 @@ fn compute_impact(sorted_commits: &[&Commit]) -> f64 {
     let ws_contribution = total_ws as f64 * 0.1;
     let effective_lines = substantive_lines as f64 + ws_contribution;
 
-    let substance = session_value(effective_lines as usize, unique_files.len());
+    // Uses `files_changed` sum (matches session_value calls in graph/trend)
+    // rather than unique-file-count — the latter would require a DB query
+    // on every window change.
+    let substance = session_value(effective_lines as usize, total_files);
     substance * (1.0 + 0.15 * (sessions as f64).ln())
 }
 

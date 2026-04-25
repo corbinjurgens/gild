@@ -11,6 +11,8 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 dirs = "6"
 git2 = "0.19"
+gix = { version = "0.82", features = ["blame"] }
+rayon = "1"
 ratatui = "0.29"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

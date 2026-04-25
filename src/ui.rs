@@ -1,8 +1,8 @@
-use crate::app::{App, FileEvent, SortMode, Theme, TrendPoint, ViewMode};
+use crate::app::{App, FileEvent, FileSortMode, SortMode, Theme, TrendPoint, ViewMode};
 use crate::identity_map::format_identity;
 use crate::fmt::{fmt_date, fmt_num};
 use anyhow::Result;
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
@@ -12,6 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 use ratatui::Terminal;
 use std::io;
+use std::sync::mpsc;
 use std::time::Duration;
 
 const GOLD: Color = Color::Rgb(255, 215, 0);
@@ -270,6 +271,53 @@ fn sparkle_top_border(frame: &mut ratatui::Frame, area: Rect) {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct LoadStep {
+    pub label: &'static str,
+    /// Whether this step may dispatch work across rayon threads. Drives the
+    /// "N threads" badge and the --max-threads hint in the loading UI.
+    pub parallel: bool,
+}
+
+pub enum LoadMsg {
+    Plan(Vec<LoadStep>),
+    StepStart(usize),
+    CommitTotal(usize),
+    CommitProgress { processed: usize, new_count: usize },
+    AddonProgress { label: &'static str, done: usize, total: usize },
+    ScanThreads(usize),
+    Done(Box<App>),
+    Failed(String),
+}
+
+struct LoadState {
+    steps: Vec<LoadStep>,
+    current_step: usize,
+    commits_total: usize,
+    commits_processed: usize,
+    new_commits: usize,
+    addon_label: &'static str,
+    addon_done: usize,
+    addon_total: usize,
+    scan_threads: usize,
+}
+
+impl Default for LoadState {
+    fn default() -> Self {
+        Self {
+            steps: Vec::new(),
+            current_step: 0,
+            commits_total: 0,
+            commits_processed: 0,
+            new_commits: 0,
+            addon_label: "",
+            addon_done: 0,
+            addon_total: 0,
+            scan_threads: 0,
+        }
+    }
+}
+
 struct RawModeGuard;
 
 impl RawModeGuard {
@@ -287,11 +335,294 @@ impl Drop for RawModeGuard {
     }
 }
 
-pub fn run(app: &mut App) -> Result<()> {
+pub fn run_with_loading(rx: mpsc::Receiver<LoadMsg>) -> Result<()> {
     let _guard = RawModeGuard::enter()?;
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    event_loop(&mut terminal, app)
+    loading_loop(&mut terminal, rx)
+}
+
+fn loading_loop(
+    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+    rx: mpsc::Receiver<LoadMsg>,
+) -> Result<()> {
+    let mut state = LoadState::default();
+
+    loop {
+        loop {
+            match rx.try_recv() {
+                Ok(LoadMsg::Plan(steps)) => {
+                    state.steps = steps;
+                }
+                Ok(LoadMsg::StepStart(idx)) => {
+                    state.current_step = idx;
+                    state.addon_label = "";
+                    state.addon_done = 0;
+                    state.addon_total = 0;
+                }
+                Ok(LoadMsg::CommitTotal(total)) => {
+                    state.commits_total = total;
+                }
+                Ok(LoadMsg::CommitProgress { processed, new_count }) => {
+                    state.commits_processed = processed;
+                    state.new_commits = new_count;
+                }
+                Ok(LoadMsg::AddonProgress { label, done, total }) => {
+                    state.addon_label = label;
+                    state.addon_done = done;
+                    state.addon_total = total;
+                    if let Some(idx) = state.steps.iter().position(|s| s.label == label) {
+                        state.current_step = idx;
+                    }
+                }
+                Ok(LoadMsg::ScanThreads(n)) => {
+                    state.scan_threads = n;
+                }
+                Ok(LoadMsg::Done(boxed)) => {
+                    let mut app = *boxed;
+                    terminal.clear()?;
+                    return event_loop(terminal, &mut app);
+                }
+                Ok(LoadMsg::Failed(msg)) => return Err(anyhow::anyhow!("{}", msg)),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(anyhow::anyhow!("loader thread exited unexpectedly"));
+                }
+            }
+        }
+
+        terminal.draw(|frame| draw_loading(frame, &state))?;
+
+        if event::poll(Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn draw_progress_bar(frame: &mut ratatui::Frame, area: Rect, done: usize, total: usize) {
+    if area.width < 10 {
+        return;
+    }
+    let pct = (done as f64 / total as f64).min(1.0);
+    let bar_w = area.width as usize;
+    let filled = (pct * bar_w as f64) as usize;
+    let empty = bar_w - filled;
+    let spans = vec![
+        Span::styled(
+            "\u{2588}".repeat(filled),
+            Style::default().fg(GILD_AMBER),
+        ),
+        Span::styled(
+            "\u{2591}".repeat(empty),
+            Style::default().fg(Color::Rgb(0x44, 0x47, 0x5a)),
+        ),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_loading(frame: &mut ratatui::Frame, state: &LoadState) {
+    let area = frame.area();
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Rgb(0x28, 0x2a, 0x36))),
+        area,
+    );
+    if area.height < 4 {
+        return;
+    }
+
+    let margin = 4u16;
+    let inner_w = area.width.saturating_sub(margin * 2);
+    let ghost = Style::default().fg(Color::Rgb(0x44, 0x47, 0x5a));
+
+    let is_commit_phase = state.current_step == 0;
+    let (done, total) = if is_commit_phase {
+        (state.commits_processed, state.commits_total)
+    } else {
+        (state.addon_done, state.addon_total)
+    };
+
+    let phase_label: String = if is_commit_phase {
+        if state.commits_total == 0 {
+            "Reading repository\u{2026}".to_string()
+        } else if state.new_commits > 0 {
+            "Scanning commits".to_string()
+        } else {
+            "Loading from cache".to_string()
+        }
+    } else if !state.addon_label.is_empty() {
+        state.addon_label.to_string()
+    } else if let Some(step) = state.steps.get(state.current_step) {
+        step.label.to_string()
+    } else {
+        "Working\u{2026}".to_string()
+    };
+
+    let count_label: Option<String> = if total > 0 {
+        if is_commit_phase && state.new_commits > 0 {
+            Some(format!(
+                "{} / {}  \u{2502}  {} new",
+                fmt_num(done),
+                fmt_num(total),
+                fmt_num(state.new_commits),
+            ))
+        } else {
+            Some(format!("{} / {}", fmt_num(done), fmt_num(total)))
+        }
+    } else {
+        None
+    };
+
+    // Is the current step actually running parallel work right now?
+    // The plan declares whether a step MAY use threads; at runtime we also
+    // require that real work is happening (not a warm cache hit).
+    let step_is_parallel = state
+        .steps
+        .get(state.current_step)
+        .map(|s| s.parallel)
+        .unwrap_or(false);
+    let currently_computing = if is_commit_phase {
+        state.new_commits > 0
+    } else {
+        state.addon_total > 0
+    };
+    let is_parallel_phase = step_is_parallel && currently_computing;
+    let show_threads_hint = is_parallel_phase && state.scan_threads > 1;
+    let show_first_run_note = currently_computing;
+
+    // Lay out vertically: title, gap, phase, count?, gap, bar?, gap, steps, gap, note?, thread hint?
+    let steps_rows = state.steps.len().max(1) as u16;
+    let mut content_h: u16 = 1 + 1 + 1; // title + gap + phase
+    if count_label.is_some() { content_h += 1; }
+    content_h += 1; // gap
+    if total > 0 { content_h += 1; } // progress bar
+    content_h += 1; // gap before steps
+    content_h += steps_rows;
+    if show_first_run_note { content_h += 2; } // gap + note
+    if show_threads_hint { content_h += 1; }
+
+    let start_y = area.y + area.height.saturating_sub(content_h) / 2;
+    let mut y = start_y;
+
+    // Title
+    if y < area.y + area.height {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("\u{2726} ", Style::default().fg(GILD_SPARK).add_modifier(Modifier::BOLD)),
+                Span::styled("gild", Style::default().fg(GILD_AMBER).add_modifier(Modifier::BOLD)),
+                Span::styled(" \u{2726}", Style::default().fg(GILD_SPARK).add_modifier(Modifier::BOLD)),
+            ])).centered(),
+            Rect { x: area.x, y, width: area.width, height: 1 },
+        );
+        y += 2; // title + gap
+    }
+
+    // Phase label
+    if y < area.y + area.height {
+        let mut spans = vec![Span::styled(phase_label.clone(), Style::default().fg(SILVER).add_modifier(Modifier::BOLD))];
+        if is_parallel_phase && state.scan_threads > 1 {
+            spans.push(Span::styled(
+                format!("  \u{00b7}  {} threads", state.scan_threads),
+                Style::default().fg(DIM),
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).centered(),
+            Rect { x: area.x, y, width: area.width, height: 1 },
+        );
+        y += 1;
+    }
+
+    // Count
+    if let Some(ref count) = count_label {
+        if y < area.y + area.height {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(count.clone(), Style::default().fg(DIM)))).centered(),
+                Rect { x: area.x, y, width: area.width, height: 1 },
+            );
+            y += 1;
+        }
+    }
+
+    y += 1; // gap before bar
+
+    // Progress bar
+    if total > 0 && y < area.y + area.height {
+        draw_progress_bar(
+            frame,
+            Rect { x: area.x + margin, y, width: inner_w, height: 1 },
+            done,
+            total,
+        );
+        y += 1;
+    }
+
+    y += 1; // gap before step list
+
+    // Step list
+    if !state.steps.is_empty() {
+        let list_w = state.steps.iter().map(|s| s.label.chars().count()).max().unwrap_or(0) + 2;
+        let list_x = area.x + area.width.saturating_sub(list_w as u16) / 2;
+        for (idx, step) in state.steps.iter().enumerate() {
+            if y >= area.y + area.height {
+                break;
+            }
+            let (sym, sym_style, label_style) = if idx < state.current_step {
+                ("\u{2713}", Style::default().fg(ADDED), Style::default().fg(DIM))
+            } else if idx == state.current_step {
+                ("\u{25b8}", Style::default().fg(GILD_AMBER).add_modifier(Modifier::BOLD),
+                 Style::default().fg(SILVER).add_modifier(Modifier::BOLD))
+            } else {
+                ("\u{00b7}", Style::default().fg(Color::Rgb(0x44, 0x47, 0x5a)),
+                 Style::default().fg(Color::Rgb(0x44, 0x47, 0x5a)))
+            };
+            let line = Line::from(vec![
+                Span::styled(sym, sym_style),
+                Span::raw(" "),
+                Span::styled(step.label.to_string(), label_style),
+            ]);
+            frame.render_widget(
+                Paragraph::new(line),
+                Rect { x: list_x, y, width: area.width.saturating_sub(list_x - area.x), height: 1 },
+            );
+            y += 1;
+        }
+    }
+
+    // First-run note
+    if show_first_run_note {
+        y += 1;
+        if y < area.y + area.height {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "First run \u{2014} results will be cached for instant future launches",
+                    ghost,
+                ))).centered(),
+                Rect { x: area.x, y, width: area.width, height: 1 },
+            );
+            y += 1;
+        }
+    }
+
+    // Thread hint
+    if show_threads_hint && y < area.y + area.height {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "use --max-threads <N> to limit CPU usage",
+                ghost,
+            ))).centered(),
+            Rect { x: area.x, y, width: area.width, height: 1 },
+        );
+    }
+
+    // Quit hint
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled("  q quit", ghost))),
+        Rect { x: area.x, y: area.y + area.height - 1, width: area.width, height: 1 },
+    );
 }
 
 fn event_loop(
@@ -321,6 +652,7 @@ fn event_loop(
 fn draw(frame: &mut ratatui::Frame, app: &App, table_state: &mut TableState) {
     match app.view_mode {
         ViewMode::Detail => draw_detail_view(frame, app),
+        ViewMode::Files => draw_files_view(frame, app),
         _ => {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -863,6 +1195,169 @@ fn draw_graph(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
+fn draw_files_view(frame: &mut ratatui::Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    draw_header(frame, app, chunks[0]);
+    draw_files_table(frame, app, chunks[1]);
+    draw_files_help(frame, app, chunks[2]);
+}
+
+fn draw_files_table(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    const W_COMMITS: usize = 9;
+    const W_AUTHORS: usize = 9;
+    const W_CHURN: usize = 9;
+    const W_COUPLING: usize = 14;
+
+    if app.file_rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new("  No file data.").style(Style::default().fg(DIM)),
+            area,
+        );
+        return;
+    }
+
+    let has_authors = app.file_rows.first().map(|r| r.unique_authors.is_some()).unwrap_or(false);
+    let has_churn = app.file_rows.first().map(|r| r.churn_score.is_some()).unwrap_or(false);
+    let has_coupling = app.file_rows.first().map(|r| r.top_coupled.is_some()).unwrap_or(false);
+    let sort = app.file_sort;
+
+    let mut header_cells = vec![
+        Cell::from(" # "),
+        Cell::from("File"),
+        metric_header("Commits", sort == FileSortMode::Commits, false, W_COMMITS),
+    ];
+    if has_authors {
+        header_cells.push(metric_header("Authors", sort == FileSortMode::Authors, false, W_AUTHORS));
+    }
+    if has_churn {
+        header_cells.push(metric_header("Churn", sort == FileSortMode::Churn, true, W_CHURN));
+    }
+    if has_coupling {
+        header_cells.push(metric_header("Top Pair", sort == FileSortMode::Coupling, false, W_COUPLING));
+    }
+    let header = Row::new(header_cells);
+
+    let rows: Vec<Row> = app.file_rows.iter().enumerate().map(|(i, row)| {
+        let rank_color = Color::White;
+
+        let mut cells = vec![
+            Cell::from(format!("{:>2} ", i + 1)).style(Style::default().fg(rank_color)),
+            Cell::from(truncate_left(&row.path, 30)).style(Style::default().fg(HEADER_COLOR)),
+            Cell::from(format!("{:>width$}", fmt_num(row.commit_count as usize), width = W_COMMITS))
+                .style(Style::default().fg(Color::White)),
+        ];
+
+        if has_authors {
+            let n = row.unique_authors.unwrap_or(0);
+            let author_color = match n {
+                0 | 1 => REMOVED,
+                2 => Color::Rgb(0xff, 0xb8, 0x6c),
+                _ => ADDED,
+            };
+            cells.push(
+                Cell::from(format!("{:>width$}", n, width = W_AUTHORS))
+                    .style(Style::default().fg(author_color)),
+            );
+        }
+        if has_churn {
+            let score = row.churn_score.unwrap_or(0.0);
+            let t = (score / 5.0).min(1.0);
+            cells.push(
+                Cell::from(format!("{:>width$.2}x", score, width = W_CHURN - 1))
+                    .style(Style::default().fg(gradient_color(&NOISE_STOPS, t))),
+            );
+        }
+        if has_coupling {
+            let pair_text = if let Some((ref partner, score)) = row.top_coupled {
+                let p = truncate_left(partner, W_COUPLING.saturating_sub(5));
+                format!("{} {:.2}", p, score)
+            } else {
+                String::new()
+            };
+            cells.push(
+                Cell::from(truncate(&pair_text, W_COUPLING))
+                    .style(Style::default().fg(DIM)),
+            );
+        }
+
+        Row::new(cells)
+    }).collect();
+
+    let mut widths = vec![
+        Constraint::Length(4),
+        Constraint::Min(20),
+        Constraint::Length(W_COMMITS as u16),
+    ];
+    if has_authors {
+        widths.push(Constraint::Length(W_AUTHORS as u16));
+    }
+    if has_churn {
+        widths.push(Constraint::Length(W_CHURN as u16));
+    }
+    if has_coupling {
+        widths.push(Constraint::Length(W_COUPLING as u16));
+    }
+
+    let mut file_table_state = TableState::default();
+    file_table_state.select(Some(app.file_selected));
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(0x44, 0x48, 0x5c))
+                .add_modifier(Modifier::BOLD),
+        );
+
+    frame.render_stateful_widget(table, area, &mut file_table_state);
+}
+
+fn draw_files_help(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let has_authors = app.file_rows.first().map(|r| r.unique_authors.is_some()).unwrap_or(false);
+    let has_churn = app.file_rows.first().map(|r| r.churn_score.is_some()).unwrap_or(false);
+    let has_coupling = app.file_rows.first().map(|r| r.top_coupled.is_some()).unwrap_or(false);
+    let sort = app.file_sort;
+
+    let active = Style::default().fg(ACTIVE_SORT).add_modifier(Modifier::BOLD);
+    let inactive = Style::default().fg(DIM);
+
+    let mut spans: Vec<Span> = vec![
+        Span::styled("[c]", if sort == FileSortMode::Commits { active } else { inactive }),
+        Span::styled("ommits ", if sort == FileSortMode::Commits { active } else { inactive }),
+    ];
+    if has_authors {
+        spans.push(Span::styled("[a]", if sort == FileSortMode::Authors { active } else { inactive }));
+        spans.push(Span::styled("uthors ", if sort == FileSortMode::Authors { active } else { inactive }));
+    }
+    if has_churn {
+        spans.push(Span::styled("[h]", if sort == FileSortMode::Churn { active } else { inactive }));
+        spans.push(Span::styled("otspot ", if sort == FileSortMode::Churn { active } else { inactive }));
+    }
+    if has_coupling {
+        spans.push(Span::styled("[p]", if sort == FileSortMode::Coupling { active } else { inactive }));
+        spans.push(Span::styled("air ", if sort == FileSortMode::Coupling { active } else { inactive }));
+    }
+    spans.extend([
+        dim(" \u{2502} "),
+        dim("[↑↓]"),
+        dim("scroll "),
+        dim("[V]"),
+        dim("back "),
+        dim("[q]"),
+        dim("uit"),
+    ]);
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn draw_detail_view(frame: &mut ratatui::Frame, app: &App) {
     let detail = match app.detail_data() {
         Some(d) => d,
@@ -1374,13 +1869,8 @@ fn draw_file_events(
         .take(inner.height as usize)
         .map(|ev| {
             let date = fmt_date(ev.timestamp, "%m-%d");
-            let path = if ev.path.len() > (inner.width as usize).saturating_sub(12) {
-                let max_w = (inner.width as usize).saturating_sub(12);
-                let start = ev.path.len().saturating_sub(max_w);
-                format!("\u{2026}{}", &ev.path[start..])
-            } else {
-                ev.path.clone()
-            };
+            let max_w = (inner.width as usize).saturating_sub(12);
+            let path = truncate_left(&ev.path, max_w);
             Line::from(vec![dim(format!(" {} ", date)), fg(path, color)])
         })
         .collect();
@@ -1461,21 +1951,23 @@ fn draw_help(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         ("[g]raph", Style::default().fg(DIM))
     };
 
-    let spans: Vec<Span> = sort_spans
-        .chain([
-            dim(" \u{2502} "),
-            Span::styled(format!("[t]{}", app.time_mode.label()), time_style),
-            dim(" [\u{2190}\u{2192}]"),
-            dim(" \u{2502} "),
-            Span::styled(view_label, view_style),
-            dim(" [↑↓]"),
-            dim("scroll "),
-            dim("[⏎]"),
-            dim("detail "),
-            dim("[q]"),
-            dim("uit"),
-        ])
-        .collect();
+    let mut extra: Vec<Span> = vec![
+        dim(" \u{2502} "),
+        Span::styled(format!("[t]{}", app.time_mode.label()), time_style),
+        dim(" [\u{2190}\u{2192}]"),
+        dim(" \u{2502} "),
+        Span::styled(view_label, view_style),
+        dim(" [↑↓]"),
+        dim("scroll "),
+        dim("[⏎]"),
+        dim("detail "),
+    ];
+    if app.has_files_view {
+        extra.push(dim("[V]"));
+        extra.push(dim("files "));
+    }
+    extra.extend([dim("[q]"), dim("uit")]);
+    let spans: Vec<Span> = sort_spans.chain(extra).collect();
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
