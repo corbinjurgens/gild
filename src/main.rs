@@ -14,6 +14,7 @@ mod gc;
 mod git;
 mod identity;
 mod identity_map;
+mod log;
 mod mailmap;
 mod ownership;
 mod questionnaire;
@@ -23,7 +24,11 @@ mod ui;
 mod util;
 
 #[derive(Parser)]
-#[command(name = "gild", about = "Interactive git contribution analyzer", version)]
+#[command(
+    name = "gild",
+    about = "Interactive git contribution analyzer",
+    version
+)]
 struct Cli {
     /// Path to git repository (local path or remote URL)
     #[arg(default_value = ".")]
@@ -41,7 +46,7 @@ struct Cli {
     #[arg(long)]
     print: bool,
 
-    /// Enable optional deep-analysis add-on (can be repeated): ownership, coupling, bus-factor, churn
+    /// Enable optional deep-analysis add-on (can be repeated): ownership, coupling, authors, hotspot, types
     #[arg(long = "add-on", value_name = "NAME")]
     add_ons: Vec<String>,
 
@@ -60,10 +65,29 @@ struct Cli {
     /// Maximum number of threads for parallel commit scanning (default: all CPU cores)
     #[arg(long, value_name = "N")]
     max_threads: Option<usize>,
+
+    /// Write verbose log with timings to the repo data directory
+    #[arg(long)]
+    log: bool,
 }
 
-fn clear_progress() {
-    eprint!("\r\x1b[2K");
+const ADDON_STEPS: &[(&str, &str, bool)] = &[
+    ("ownership", "Analyzing ownership", true),
+    ("coupling", "Analyzing file coupling", false),
+    ("authors", "Analyzing authors", false),
+    ("hotspot", "Analyzing hotspots", false),
+    ("types", "Analyzing commit types", false),
+];
+
+fn addon_label(name: &str) -> &'static str {
+    match name {
+        "ownership" => "Analyzing ownership",
+        "coupling" => "Analyzing file coupling",
+        "authors" => "Analyzing authors",
+        "hotspot" => "Analyzing hotspots",
+        "types" => "Analyzing commit types",
+        _ => unreachable!("validated in main"),
+    }
 }
 
 fn main() -> Result<()> {
@@ -81,13 +105,33 @@ fn main() -> Result<()> {
 
     let repo_key = storage::resolve_repo_key(&path)?;
 
-    const VALID_ADDONS: &[&str] = &["ownership", "coupling", "bus-factor", "churn"];
-    for name in &cli.add_ons {
-        if !VALID_ADDONS.contains(&name.as_str()) {
+    const ALIASES: &[(&str, &str)] = &[
+        ("blame", "ownership"),
+        ("bus-factor", "authors"),
+        ("churn", "hotspot"),
+        ("commit-types", "types"),
+    ];
+    let add_ons: Vec<String> = cli
+        .add_ons
+        .iter()
+        .map(|name| {
+            ALIASES
+                .iter()
+                .find(|&&(alias, _)| alias == name.as_str())
+                .map(|&(_, canon)| canon.to_string())
+                .unwrap_or_else(|| name.clone())
+        })
+        .collect();
+    for name in &add_ons {
+        if !ADDON_STEPS.iter().any(|&(n, _, _)| n == name.as_str()) {
             anyhow::bail!(
                 "Unknown add-on '{}'. Valid add-ons: {}",
                 name,
-                VALID_ADDONS.join(", ")
+                ADDON_STEPS
+                    .iter()
+                    .map(|&(n, _, _)| n)
+                    .collect::<Vec<_>>()
+                    .join(", "),
             );
         }
     }
@@ -116,21 +160,58 @@ fn main() -> Result<()> {
     }
     let _ = std::fs::remove_dir(&legacy_gild_dir);
 
-    let thread_count = cli.max_threads
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    let thread_count = cli.max_threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    });
     if let Some(n) = cli.max_threads {
-        let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global();
+    }
+
+    let mut logger = if cli.log {
+        let log_path = storage::repo_data_dir(&repo_key).join("gild.log");
+        match log::Logger::open(&log_path) {
+            Some(l) => {
+                eprintln!("Logging to {}", log_path.display());
+                Some(l)
+            }
+            None => {
+                eprintln!("Warning: could not create log file {}", log_path.display());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(ref mut l) = logger {
+        l.info(&format!("repo: {}", path.display()));
+        l.info(&format!("threads: {thread_count}"));
+        if !add_ons.is_empty() {
+            l.info(&format!("add-ons: {}", add_ons.join(", ")));
+        }
+        if let Some(n) = cli.max_commits {
+            l.info(&format!("max-commits: {n}"));
+        }
     }
 
     if cli.export.is_some() || cli.print {
-        let mut app = load_sync(
-            &path,
-            &storage::db_path(&repo_key),
-            &map_path,
-            cli.branch.as_deref(),
-            cli.max_commits,
-            &cli.add_ons,
-        )?;
+        let progress = StderrProgress;
+        let mut app = load(LoadParams {
+            path: &path,
+            db_path: &storage::db_path(&repo_key),
+            map_path: &map_path,
+            branch: cli.branch.as_deref(),
+            max_commits: cli.max_commits,
+            add_ons: &add_ons,
+            logger: &mut logger,
+            progress: &progress,
+        })?;
+        if let Some(ref mut l) = logger {
+            l.finish();
+        }
         if let Some(ref format) = cli.export {
             app.set_time_mode(app::TimeMode::All);
             export::export(&app, format, cli.output.as_deref())?;
@@ -142,9 +223,29 @@ fn main() -> Result<()> {
         let db_path = storage::db_path(&repo_key);
         let branch = cli.branch.clone();
         let max_commits = cli.max_commits;
-        let add_ons = cli.add_ons.clone();
         std::thread::spawn(move || {
-            load_in_background(path, branch, max_commits, add_ons, db_path, map_path, thread_count, tx);
+            let progress = ChannelProgress::new(tx.clone(), &add_ons, thread_count);
+            let result = load(LoadParams {
+                path: &path,
+                db_path: &db_path,
+                map_path: &map_path,
+                branch: branch.as_deref(),
+                max_commits,
+                add_ons: &add_ons,
+                logger: &mut logger,
+                progress: &progress,
+            });
+            if let Some(ref mut l) = logger {
+                l.finish();
+            }
+            match result {
+                Ok(app) => {
+                    let _ = tx.send(ui::LoadMsg::Done(Box::new(app)));
+                }
+                Err(e) => {
+                    let _ = tx.send(ui::LoadMsg::Failed(e.to_string()));
+                }
+            }
         });
         ui::run_with_loading(rx)?;
     }
@@ -152,51 +253,167 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn load_sync(
-    path: &std::path::Path,
-    db_path: &std::path::Path,
-    map_path: &std::path::Path,
-    branch: Option<&str>,
+trait Progress {
+    fn step_start(&self, _label: &'static str) {}
+    fn commit_total(&self, _total: usize) {}
+    fn commit_progress(&self, _processed: usize, _new_count: usize) {}
+    fn addon_progress(&self, _label: &'static str, _done: usize, _total: usize) {}
+    fn clear_line(&self) {}
+    fn info(&self, _msg: &str) {}
+}
+
+struct StderrProgress;
+
+impl Progress for StderrProgress {
+    fn commit_progress(&self, processed: usize, new: usize) {
+        let step = match processed {
+            0..=99 => 1,
+            100..=999 => 10,
+            1000..=9999 => 100,
+            _ => 1000,
+        };
+        if processed.is_multiple_of(step) {
+            if new > 0 {
+                eprint!("\r  Scanning... {processed} commits ({new} new)");
+            } else {
+                eprint!("\r  Loading... {processed} commits (cached)");
+            }
+        }
+    }
+
+    fn addon_progress(&self, label: &'static str, done: usize, total: usize) {
+        eprint!("\r  {label}... {done}/{total}");
+    }
+
+    fn clear_line(&self) {
+        eprint!("\r\x1b[2K");
+    }
+
+    fn info(&self, msg: &str) {
+        eprintln!("  {msg}");
+    }
+}
+
+struct ChannelProgress {
+    tx: std::sync::mpsc::Sender<ui::LoadMsg>,
+    steps: Vec<ui::LoadStep>,
+}
+
+impl ChannelProgress {
+    fn new(
+        tx: std::sync::mpsc::Sender<ui::LoadMsg>,
+        add_ons: &[String],
+        thread_count: usize,
+    ) -> Self {
+        let mut steps = vec![ui::LoadStep {
+            label: "Scanning commits",
+            parallel: true,
+        }];
+        for &(name, label, parallel) in ADDON_STEPS {
+            if add_ons.iter().any(|a| a == name) {
+                steps.push(ui::LoadStep { label, parallel });
+            }
+        }
+        let _ = tx.send(ui::LoadMsg::ScanThreads(thread_count));
+        let _ = tx.send(ui::LoadMsg::Plan(steps.clone()));
+        Self { tx, steps }
+    }
+}
+
+impl Progress for ChannelProgress {
+    fn step_start(&self, label: &'static str) {
+        let idx = self
+            .steps
+            .iter()
+            .position(|s| s.label == label)
+            .unwrap_or(0);
+        let _ = self.tx.send(ui::LoadMsg::StepStart(idx));
+    }
+
+    fn commit_total(&self, total: usize) {
+        let _ = self.tx.send(ui::LoadMsg::CommitTotal(total));
+    }
+
+    fn commit_progress(&self, processed: usize, new_count: usize) {
+        let _ = self.tx.send(ui::LoadMsg::CommitProgress {
+            processed,
+            new_count,
+        });
+    }
+
+    fn addon_progress(&self, label: &'static str, done: usize, total: usize) {
+        let _ = self.tx.send(ui::LoadMsg::AddonProgress { label, done, total });
+    }
+}
+
+struct LoadParams<'a> {
+    path: &'a std::path::Path,
+    db_path: &'a std::path::Path,
+    map_path: &'a std::path::Path,
+    branch: Option<&'a str>,
     max_commits: Option<usize>,
-    add_ons: &[String],
-) -> Result<app::App> {
+    add_ons: &'a [String],
+    logger: &'a mut Option<log::Logger>,
+    progress: &'a (dyn Progress + Sync),
+}
+
+fn load(p: LoadParams) -> Result<app::App> {
+    let LoadParams { path, db_path, map_path, branch, max_commits, add_ons, logger, progress } = p;
+    progress.step_start("Scanning commits");
+
     let db = db::Database::open(db_path)?;
     gc::run(path, &db)?;
+    if let Some(ref mut l) = logger {
+        l.phase_start("cache load");
+    }
     let mut commit_cache = cache::Cache::load(&db)?;
 
-    let (info, repo, mut commits) = git::load_commits(
+    if let Some(ref mut l) = logger {
+        l.phase_start("commit scan");
+    }
+    let (info, mut commits) = git::load_commits(
         path,
         branch,
         max_commits,
         &mut commit_cache,
-        |_| {},
-        |processed, new| {
-            let step = match processed {
-                0..=99 => 1,
-                100..=999 => 10,
-                1000..=9999 => 100,
-                _ => 1000,
-            };
-            if processed % step == 0 {
-                if new > 0 {
-                    eprint!("\r  Scanning... {} commits ({} new)", processed, new);
-                } else {
-                    eprint!("\r  Loading... {} commits (cached)", processed);
-                }
-            }
-        },
+        |total| progress.commit_total(total),
+        |processed, new| progress.commit_progress(processed, new),
     )?;
-    clear_progress();
+    progress.clear_line();
 
     if commits.is_empty() {
         anyhow::bail!("No commits found.");
     }
 
+    let repo = gix::open(path)?;
+
+    let new_count = commit_cache.staged_count();
+    if let Some(ref mut l) = logger {
+        l.info(&format!("total commits: {}", commits.len()));
+        l.info(&format!("new commits: {new_count}"));
+        l.info(&format!("cached commits: {}", commits.len() - new_count));
+        l.info(&format!("authors (raw): {}", {
+            let mut emails: Vec<&str> = commits.iter().map(|c| c.author_email.as_str()).collect();
+            emails.sort_unstable();
+            emails.dedup();
+            emails.len()
+        }));
+    }
+
+    if let Some(ref mut l) = logger {
+        l.phase_start("cache save");
+    }
     commit_cache.save(&db)?;
 
+    if let Some(ref mut l) = logger {
+        l.phase_start("identity merge");
+    }
     let mailmap_entries = mailmap::load(path);
     if !mailmap_entries.is_empty() {
-        eprintln!("  .mailmap: {} entries loaded", mailmap_entries.len());
+        progress.info(&format!(
+            ".mailmap: {} entries loaded",
+            mailmap_entries.len()
+        ));
     }
 
     let identity_map = identity_map::IdentityMap::load(map_path);
@@ -204,18 +421,29 @@ fn load_sync(
     for (commit, &gid) in commits.iter_mut().zip(assignments.iter()) {
         commit.group_id = gid;
     }
+    if let Some(ref mut l) = logger {
+        l.info(&format!("identity groups: {}", groups.len()));
+    }
 
     let ownership_data = if add_ons.iter().any(|a| a == "ownership") {
+        let label = addon_label("ownership");
+        progress.step_start(label);
+        if let Some(ref mut l) = logger {
+            l.phase_start(label);
+        }
         match ownership::compute(&repo, &db, &groups, |done, total| {
-            eprint!("\r  Ownership... {}/{} files", done, total);
+            progress.addon_progress(label, done, total);
         }) {
             Ok(data) => {
-                clear_progress();
+                progress.clear_line();
                 Some(data)
             }
             Err(e) => {
-                clear_progress();
-                eprintln!("  --add-on ownership: skipped ({})", e);
+                progress.clear_line();
+                progress.info(&format!("--add-on ownership: skipped ({e})"));
+                if let Some(ref mut l) = logger {
+                    l.info(&format!("ownership skipped: {e}"));
+                }
                 None
             }
         }
@@ -227,13 +455,15 @@ fn load_sync(
         &repo,
         &db,
         add_ons,
-        |_label| {},
-        |label, done, total| {
-            eprint!("\r  {}... {}/{}", label, done, total);
-        },
+        |label| progress.step_start(label),
+        |label, done, total| progress.addon_progress(label, done, total),
+        logger,
     );
-    clear_progress();
+    progress.clear_line();
 
+    if let Some(ref mut l) = logger {
+        l.phase_start("app init");
+    }
     let mut app = app::App::new(
         commits,
         groups,
@@ -250,154 +480,37 @@ fn load_sync(
     if !file_rows.is_empty() {
         app.set_file_data(file_rows);
     }
+    if add_ons.iter().any(|a| a == "types") {
+        let label = addon_label("types");
+        progress.step_start(label);
+        if let Some(ref mut l) = logger {
+            l.phase_start(label);
+        }
+        app.set_commit_types();
+    }
 
     Ok(app)
 }
 
-fn load_in_background(
-    path: PathBuf,
-    branch: Option<String>,
-    max_commits: Option<usize>,
-    add_ons: Vec<String>,
-    db_path: PathBuf,
-    identities_path: PathBuf,
-    thread_count: usize,
-    tx: std::sync::mpsc::Sender<ui::LoadMsg>,
-) {
-    tx.send(ui::LoadMsg::ScanThreads(thread_count)).ok();
-
-    // Each step declares whether it may dispatch work across rayon threads so
-    // the loading UI can show the "N threads" badge without re-hardcoding the
-    // set of parallel phases. Keep this list in sync with the actual work
-    // dispatched below.
-    let mut plan: Vec<ui::LoadStep> = vec![ui::LoadStep {
-        label: "Scanning commits",
-        parallel: true,
-    }];
-    if add_ons.iter().any(|a| a == "ownership") {
-        plan.push(ui::LoadStep { label: "Analyzing ownership", parallel: true });
-    }
-    if add_ons.iter().any(|a| a == "coupling") {
-        plan.push(ui::LoadStep { label: "Analyzing file coupling", parallel: false });
-    }
-    if add_ons.iter().any(|a| a == "bus-factor") {
-        plan.push(ui::LoadStep { label: "Analyzing bus factor", parallel: false });
-    }
-    if add_ons.iter().any(|a| a == "churn") {
-        plan.push(ui::LoadStep { label: "Analyzing churn", parallel: false });
-    }
-    let plan_for_lookup = plan.clone();
-    let step_idx = move |label: &'static str| -> usize {
-        plan_for_lookup
-            .iter()
-            .position(|s| s.label == label)
-            .unwrap_or(0)
-    };
-    tx.send(ui::LoadMsg::Plan(plan)).ok();
-    tx.send(ui::LoadMsg::StepStart(0)).ok();
-
-    let result = (|| -> Result<Box<app::App>> {
-        let db = db::Database::open(&db_path)?;
-        gc::run(&path, &db)?;
-        let mut commit_cache = cache::Cache::load(&db)?;
-
-        let (info, repo, mut commits) = git::load_commits(
-            &path,
-            branch.as_deref(),
-            max_commits,
-            &mut commit_cache,
-            |total| {
-                tx.send(ui::LoadMsg::CommitTotal(total)).ok();
-            },
-            |processed, new| {
-                tx.send(ui::LoadMsg::CommitProgress { processed, new_count: new }).ok();
-            },
-        )?;
-
-        if commits.is_empty() {
-            anyhow::bail!("No commits found.");
-        }
-
-        commit_cache.save(&db)?;
-
-        let mailmap_entries = mailmap::load(&path);
-        let identity_map = identity_map::IdentityMap::load(&identities_path);
-        let (groups, assignments) = identity::merge(&commits, &identity_map, &mailmap_entries);
-        for (commit, &gid) in commits.iter_mut().zip(assignments.iter()) {
-            commit.group_id = gid;
-        }
-
-        let ownership_data = if add_ons.iter().any(|a| a == "ownership") {
-            tx.send(ui::LoadMsg::StepStart(step_idx("Analyzing ownership"))).ok();
-            ownership::compute(&repo, &db, &groups, |done, total| {
-                tx.send(ui::LoadMsg::AddonProgress {
-                    label: "Analyzing ownership",
-                    done,
-                    total,
-                })
-                .ok();
-            })
-            .ok()
-        } else {
-            None
-        };
-
-        let file_rows = run_file_addons(
-            &repo,
-            &db,
-            &add_ons,
-            |label| {
-                tx.send(ui::LoadMsg::StepStart(step_idx(label))).ok();
-            },
-            |label, done, total| {
-                tx.send(ui::LoadMsg::AddonProgress { label, done, total }).ok();
-            },
-        );
-
-        let mut app = app::App::new(
-            commits,
-            groups,
-            info,
-            identity_map,
-            identities_path,
-            mailmap_entries,
-            db,
-        );
-        if let Some(data) = ownership_data {
-            let (per_group, mapped_total) = ownership::map_to_groups(&data, app.groups());
-            app.set_ownership(per_group, mapped_total);
-        }
-        if !file_rows.is_empty() {
-            app.set_file_data(file_rows);
-        }
-
-        Ok(Box::new(app))
-    })();
-
-    match result {
-        Ok(app) => { tx.send(ui::LoadMsg::Done(app)).ok(); }
-        Err(e) => { tx.send(ui::LoadMsg::Failed(e.to_string())).ok(); }
-    }
-}
-
 fn run_file_addons(
-    repo: &git2::Repository,
+    repo: &gix::Repository,
     db: &db::Database,
     add_ons: &[String],
     on_step_start: impl Fn(&'static str),
     on_progress: impl Fn(&'static str, usize, usize),
+    logger: &mut Option<log::Logger>,
 ) -> Vec<app::FileRow> {
     let need_coupling = add_ons.iter().any(|a| a == "coupling");
-    let need_bus_factor = add_ons.iter().any(|a| a == "bus-factor");
-    let need_churn = add_ons.iter().any(|a| a == "churn");
+    let need_bus_factor = add_ons.iter().any(|a| a == "authors");
+    let need_churn = add_ons.iter().any(|a| a == "hotspot");
 
     if !need_coupling && !need_bus_factor && !need_churn {
         return Vec::new();
     }
 
-    let head_hash = match repo.head().and_then(|r| r.peel_to_commit()) {
-        Ok(c) => c.id().to_string(),
-        Err(_) => return Vec::new(),
+    let head_hash = match repo.head().map(|h| h.into_peeled_id()) {
+        Ok(Ok(id)) => id.to_string(),
+        _ => return Vec::new(),
     };
 
     let mut file_map: std::collections::HashMap<String, app::FileRow> =
@@ -417,10 +530,17 @@ fn run_file_addons(
     }
 
     if need_coupling {
-        on_step_start("Analyzing file coupling");
+        let label = addon_label("coupling");
+        on_step_start(label);
+        if let Some(ref mut l) = logger {
+            l.phase_start(label);
+        }
         if let Ok(rows) = coupling::compute(db, &head_hash, |done, total| {
-            on_progress("Analyzing file coupling", done, total);
+            on_progress(label, done, total);
         }) {
+            if let Some(ref mut l) = logger {
+                l.info(&format!("coupling pairs: {}", rows.len()));
+            }
             for row in rows {
                 let entry = row_entry(&mut file_map, &row.file);
                 entry.commit_count = row.commit_count;
@@ -430,10 +550,17 @@ fn run_file_addons(
     }
 
     if need_bus_factor {
-        on_step_start("Analyzing bus factor");
+        let label = addon_label("authors");
+        on_step_start(label);
+        if let Some(ref mut l) = logger {
+            l.phase_start(label);
+        }
         if let Ok(rows) = bus_factor::compute(repo, db, |done, total| {
-            on_progress("Analyzing bus factor", done, total);
+            on_progress(label, done, total);
         }) {
+            if let Some(ref mut l) = logger {
+                l.info(&format!("files with authors: {}", rows.len()));
+            }
             for row in rows {
                 row_entry(&mut file_map, &row.file).unique_authors = Some(row.unique_authors);
             }
@@ -441,9 +568,13 @@ fn run_file_addons(
     }
 
     if need_churn {
-        on_step_start("Analyzing churn");
+        let label = addon_label("hotspot");
+        on_step_start(label);
+        if let Some(ref mut l) = logger {
+            l.phase_start(label);
+        }
         if let Ok(rows) = churn::compute(repo, db, &head_hash, |done, total| {
-            on_progress("Analyzing churn", done, total);
+            on_progress(label, done, total);
         }) {
             for row in rows {
                 let entry = row_entry(&mut file_map, &row.file);

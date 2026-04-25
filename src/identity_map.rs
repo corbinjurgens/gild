@@ -26,7 +26,7 @@ pub struct MapPair {
 }
 
 pub fn format_identity(name: &str, email: &str) -> String {
-    format!("{} <{}>", name, email)
+    format!("{name} <{email}>")
 }
 
 pub fn parse_identity(s: &str) -> Option<(String, String)> {
@@ -80,14 +80,8 @@ impl IdentityMap {
     }
 
     pub fn add_merge(&mut self, group_a: &[(String, String)], group_b: &[(String, String)]) {
-        let formatted_a: Vec<String> = group_a
-            .iter()
-            .map(|(n, e)| format_identity(n, e))
-            .collect();
-        let formatted_b: Vec<String> = group_b
-            .iter()
-            .map(|(n, e)| format_identity(n, e))
-            .collect();
+        let formatted_a: Vec<String> = group_a.iter().map(|(n, e)| format_identity(n, e)).collect();
+        let formatted_b: Vec<String> = group_b.iter().map(|(n, e)| format_identity(n, e)).collect();
 
         let existing_idx_a = formatted_a
             .iter()
@@ -156,5 +150,67 @@ impl IdentityMap {
         if !self.is_unsure(&fa, &fb) {
             self.unsure.push(MapPair { a: fa, b: fb });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_basic() {
+        assert_eq!(format_identity("Alice", "a@x.com"), "Alice <a@x.com>");
+    }
+
+    #[test]
+    fn parse_basic() {
+        assert_eq!(
+            parse_identity("Alice <a@x.com>"),
+            Some(("Alice".into(), "a@x.com".into()))
+        );
+    }
+
+    #[test]
+    fn parse_trimmed() {
+        assert_eq!(
+            parse_identity("  Alice  <a@x.com>  "),
+            Some(("Alice".into(), "a@x.com".into()))
+        );
+    }
+
+    #[test]
+    fn parse_empty_name() {
+        assert_eq!(
+            parse_identity("<a@x.com>"),
+            Some(("".into(), "a@x.com".into()))
+        );
+    }
+
+    #[test]
+    fn parse_no_brackets() {
+        assert_eq!(parse_identity("a@x.com"), None);
+    }
+
+    #[test]
+    fn parse_empty() {
+        assert_eq!(parse_identity(""), None);
+    }
+
+    #[test]
+    fn parse_no_close_bracket() {
+        assert_eq!(parse_identity("Alice <bad"), None);
+    }
+
+    #[test]
+    fn parse_close_before_open() {
+        assert_eq!(parse_identity("Alice >bad<"), None);
+    }
+
+    #[test]
+    fn round_trip() {
+        let s = format_identity("Alice", "a@x.com");
+        let (name, email) = parse_identity(&s).unwrap();
+        assert_eq!(name, "Alice");
+        assert_eq!(email, "a@x.com");
     }
 }

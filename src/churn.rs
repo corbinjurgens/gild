@@ -1,31 +1,28 @@
 use anyhow::Result;
-use git2::Repository;
 use rusqlite::params;
 use std::collections::HashMap;
 
 use crate::db::{Database, FILE_KIND_TOUCHED};
 
-#[allow(dead_code)]
 pub struct ChurnRow {
     pub file: String,
     pub commit_count: u32,
-    pub current_lines: u32,
     pub churn_score: f64,
 }
 
 fn cache_key(db: &Database, head_hash: &str) -> Result<String> {
-    let (count, max_ts): (i64, i64) = db.conn.query_row(
+    let (count, max_ts): (i64, i64) = db.query_row(
         "SELECT COUNT(*), COALESCE(MAX(timestamp), 0) FROM commits",
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     // Matches coupling's key: head_hash ties `current_lines` (computed from
     // HEAD's tree) to the specific HEAD it was measured at.
-    Ok(format!("n={},ts={},head={}", count, max_ts, head_hash))
+    Ok(format!("n={count},ts={max_ts},head={head_hash}"))
 }
 
 pub fn compute(
-    repo: &Repository,
+    repo: &gix::Repository,
     db: &Database,
     head_hash: &str,
     on_progress: impl Fn(usize, usize),
@@ -33,7 +30,6 @@ pub fn compute(
     let key = cache_key(db, head_hash)?;
 
     let has_churn: i64 = db
-        .conn
         .query_row(
             "SELECT COUNT(*) FROM file_stats WHERE cache_key = ?1 AND churn_score > 0",
             params![&key],
@@ -44,15 +40,12 @@ pub fn compute(
         return load_from_db(db, &key);
     }
 
-    let head = repo.head()?.peel_to_commit()?;
-    let tree = head.tree()?;
-    let file_sizes = crate::ownership::walk_tree_sizes(repo, &tree);
+    let file_sizes = crate::ownership::walk_tree_sizes(repo);
     let total = file_sizes.len();
     on_progress(0, total);
 
     // Prefer commit counts already populated by `coupling` (they share the cache key).
     let coupling_count: i64 = db
-        .conn
         .query_row(
             "SELECT COUNT(*) FROM file_stats WHERE cache_key = ?1 AND commit_count > 0",
             params![&key],
@@ -61,18 +54,19 @@ pub fn compute(
         .unwrap_or(0);
 
     let file_commit_counts: HashMap<String, u32> = if coupling_count > 0 {
-        let mut stmt = db.conn.prepare(
-            "SELECT file, commit_count FROM file_stats WHERE cache_key = ?1",
-        )?;
+        let mut stmt =
+            db.prepare("SELECT file, commit_count FROM file_stats WHERE cache_key = ?1")?;
         let rows = stmt.query_map(params![&key], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
         })?;
         rows.filter_map(|r| r.ok()).collect()
     } else {
-        let mut stmt = db.conn.prepare(
-            "SELECT file_path, COUNT(*)
-             FROM commit_files WHERE kind = ?1
-             GROUP BY file_path",
+        let mut stmt = db.prepare(
+            "SELECT cf.file_path, COUNT(*)
+             FROM commit_files cf
+             JOIN commits c ON c.hash = cf.commit_hash
+             WHERE cf.kind = ?1 AND c.is_merge = 0
+             GROUP BY cf.file_path",
         )?;
         let rows = stmt.query_map(params![FILE_KIND_TOUCHED], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
@@ -84,7 +78,7 @@ pub fn compute(
 
     on_progress(total, total);
 
-    let tx = db.conn.unchecked_transaction()?;
+    let tx = db.transaction()?;
     if coupling_count > 0 {
         let mut stmt = tx.prepare(
             "UPDATE file_stats SET current_lines = ?1, churn_score = ?2
@@ -96,7 +90,10 @@ pub fn compute(
             stmt.execute(params![current_lines as i64, churn_score, file, &key])?;
         }
     } else {
-        tx.execute("DELETE FROM file_stats WHERE cache_key != ?1", params![&key])?;
+        tx.execute(
+            "DELETE FROM file_stats WHERE cache_key != ?1",
+            params![&key],
+        )?;
         let mut stmt = tx.prepare(
             "INSERT OR REPLACE INTO file_stats (file, commit_count, current_lines, churn_score, cache_key)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -119,8 +116,8 @@ pub fn compute(
 }
 
 fn load_from_db(db: &Database, key: &str) -> Result<Vec<ChurnRow>> {
-    let mut stmt = db.conn.prepare(
-        "SELECT file, commit_count, current_lines, churn_score
+    let mut stmt = db.prepare(
+        "SELECT file, commit_count, churn_score
          FROM file_stats WHERE cache_key = ?1 AND churn_score > 0
          ORDER BY churn_score DESC",
     )?;
@@ -128,8 +125,7 @@ fn load_from_db(db: &Database, key: &str) -> Result<Vec<ChurnRow>> {
         Ok(ChurnRow {
             file: r.get(0)?,
             commit_count: r.get::<_, i64>(1)? as u32,
-            current_lines: r.get::<_, i64>(2)? as u32,
-            churn_score: r.get(3)?,
+            churn_score: r.get(2)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

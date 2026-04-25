@@ -5,7 +5,37 @@ use std::path::Path;
 use std::time::Duration;
 
 pub struct Database {
-    pub conn: Connection,
+    conn: Connection,
+}
+
+impl Database {
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        migrate(&conn)?;
+        Ok(Database { conn })
+    }
+
+    pub(crate) fn prepare(&self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'_>> {
+        self.conn.prepare(sql)
+    }
+
+    pub(crate) fn query_row<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.conn.query_row(sql, params, f)
+    }
+
+    pub(crate) fn transaction(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        self.conn.unchecked_transaction()
+    }
 }
 
 // `commit_files.kind`: 0 = touched, 1 = added, 2 = deleted.
@@ -93,21 +123,10 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (head_hash, file_path, author_email)
     ) WITHOUT ROWID;
     "#,
+    r#"
+    ALTER TABLE commits ADD COLUMN files_renamed INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
-
-impl Database {
-    pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        migrate(&conn)?;
-        Ok(Database { conn })
-    }
-}
 
 fn migrate(conn: &Connection) -> Result<()> {
     conn.execute(
@@ -124,10 +143,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         if target > current {
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(sql)?;
-            tx.execute(
-                "INSERT INTO schema_version (version) VALUES (?1)",
-                [target],
-            )?;
+            tx.execute("INSERT INTO schema_version (version) VALUES (?1)", [target])?;
             tx.commit()?;
         }
     }

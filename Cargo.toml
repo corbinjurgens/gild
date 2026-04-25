@@ -2,7 +2,15 @@
 name = "gild"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.70"
 description = "Gild — interactive git contribution analyzer with fair impact scoring"
+license = "MIT"
+repository = "https://github.com/corbinjurgens/git-pulse"
+homepage = "https://github.com/corbinjurgens/git-pulse"
+readme = "README.md"
+authors = ["Corbin Jurgens <corbinjurgens@gmail.com>"]
+keywords = ["git", "analytics", "tui", "contributions", "blame"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"
@@ -10,8 +18,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 dirs = "6"
-git2 = "0.19"
-gix = { version = "0.82", features = ["blame"] }
+gix = { version = "0.82", features = ["blame", "parallel", "blocking-network-client"] }
 rayon = "1"
 ratatui = "0.29"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -19,3 +26,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 strsim = "0.11"
 toml = "0.8"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,5 +1,5 @@
 use crate::app::{App, AuthorStats};
-use crate::fmt::{fmt_date, fmt_num};
+use crate::fmt::{fmt_date, Sep};
 use anyhow::Result;
 use std::fs;
 use std::io::Write;
@@ -10,7 +10,7 @@ pub fn export(app: &App, format: &str, output: Option<&Path>) -> Result<()> {
         "json" => export_json(app)?,
         "csv" => export_csv(app),
         "html" => export_html(app),
-        _ => anyhow::bail!("Unknown export format: {}. Use json, csv, or html.", format),
+        _ => anyhow::bail!("Unknown export format: {format}. Use json, csv, or html."),
     };
 
     match output {
@@ -70,10 +70,12 @@ fn author_to_json(rank: usize, a: &AuthorStats) -> serde_json::Value {
     obj["change_types"] = serde_json::json!({
         "feature": ct.feature,
         "refactor": ct.refactor,
+        "rename": ct.rename,
         "trivial": ct.trivial,
         "merge": ct.merge,
         "new_files": ct.new_files,
         "deleted_files": ct.deleted_files,
+        "renamed_files": ct.renamed_files,
         "whitespace_lines": ct.whitespace_lines,
     });
 
@@ -82,14 +84,14 @@ fn author_to_json(rank: usize, a: &AuthorStats) -> serde_json::Value {
 
 fn export_csv(app: &App) -> String {
     let mut out = String::from(
-        "Rank,Author,Commits,Lines Added,Lines Removed,Net Lines,Files Changed,Impact,Ownership Lines,Ownership %,Feature,Refactor,Trivial,Merge,New Files,Deleted Files,Whitespace Lines,First Commit,Last Commit\n",
+        "Rank,Author,Commits,Lines Added,Lines Removed,Net Lines,Files Changed,Impact,Ownership Lines,Ownership %,Feature,Refactor,Rename,Trivial,Merge,New Files,Deleted Files,Renamed Files,Whitespace Lines,First Commit,Last Commit\n",
     );
 
     for (i, a) in app.sorted_authors().enumerate() {
         let net = a.lines_added as i64 - a.lines_removed as i64;
         let ct = &a.change_types;
         out.push_str(&format!(
-            "{},\"{}\",{},{},{},{},{},{:.1},{},{:.1},{},{},{},{},{},{},{},{},{}\n",
+            "{},\"{}\",{},{},{},{},{},{:.1},{},{:.1},{},{},{},{},{},{},{},{},{},{},{}\n",
             i + 1,
             a.display_name.replace('"', "\"\""),
             a.commits,
@@ -102,10 +104,12 @@ fn export_csv(app: &App) -> String {
             a.ownership_pct,
             ct.feature,
             ct.refactor,
+            ct.rename,
             ct.trivial,
             ct.merge,
             ct.new_files,
             ct.deleted_files,
+            ct.renamed_files,
             ct.whitespace_lines,
             fmt_date(a.first_commit, "%Y-%m-%d"),
             fmt_date(a.last_commit, "%Y-%m-%d"),
@@ -136,7 +140,7 @@ fn export_html(app: &App) -> String {
             _ => "",
         };
         let ownership = if a.ownership_lines > 0 {
-            format!("{} ({:.1}%)", fmt_num(a.ownership_lines), a.ownership_pct)
+            format!("{} ({:.1}%)", Sep(a.ownership_lines), a.ownership_pct)
         } else {
             String::from("-")
         };
@@ -156,10 +160,10 @@ fn export_html(app: &App) -> String {
 </tr>
 "#,
             name = html_escape(&a.display_name),
-            commits = fmt_num(a.commits),
-            added = fmt_num(a.lines_added),
-            removed = fmt_num(a.lines_removed),
-            files = fmt_num(a.files_changed),
+            commits = Sep(a.commits),
+            added = Sep(a.lines_added),
+            removed = Sep(a.lines_removed),
+            files = Sep(a.files_changed),
             impact = a.impact,
         ));
     }
@@ -205,7 +209,7 @@ tr:hover {{ background:#44475a; }}
 </html>"#,
         repo = html_escape(&app.repo_info.name),
         branch = html_escape(&app.repo_info.branch),
-        commits = fmt_num(app.filtered_commits),
+        commits = Sep(app.filtered_commits),
         authors = app.authors.len(),
         time = html_escape(&app.time_label()),
     )

@@ -57,9 +57,9 @@ pub fn find_candidates(
 
 fn pair_key(a: &str, b: &str) -> String {
     if a <= b {
-        format!("{}\x00{}", a, b)
+        format!("{a}\x00{b}")
     } else {
-        format!("{}\x00{}", b, a)
+        format!("{b}\x00{a}")
     }
 }
 
@@ -105,8 +105,7 @@ fn similarity_score(a: &[AliasNorm], b: &[AliasNorm]) -> Option<usize> {
             }
 
             if !na.name.is_empty() && !nb.name.is_empty() {
-                if name_contains_word(&na.name, &nb.name)
-                    || name_contains_word(&nb.name, &na.name)
+                if name_contains_word(&na.name, &nb.name) || name_contains_word(&nb.name, &na.name)
                 {
                     let score = if na.domain == nb.domain { 80 } else { 60 };
                     best = best.max(score);
@@ -120,14 +119,10 @@ fn similarity_score(a: &[AliasNorm], b: &[AliasNorm]) -> Option<usize> {
                 }
             }
 
-            if na.local.len() >= 3
-                && (nb.name.contains(&na.local) || na.local.contains(&nb.name))
-            {
+            if na.local.len() >= 3 && (nb.name.contains(&na.local) || na.local.contains(&nb.name)) {
                 best = best.max(55);
             }
-            if nb.local.len() >= 3
-                && (na.name.contains(&nb.local) || nb.local.contains(&na.name))
-            {
+            if nb.local.len() >= 3 && (na.name.contains(&nb.local) || nb.local.contains(&na.name)) {
                 best = best.max(55);
             }
         }

@@ -23,11 +23,8 @@ pub fn merge<'a>(
     let pairs: Vec<(&'a str, &'a str)> = pair_counts.keys().copied().collect();
     let n = pairs.len();
 
-    let pair_index: HashMap<(&str, &str), usize> = pairs
-        .iter()
-        .enumerate()
-        .map(|(i, &p)| (p, i))
-        .collect();
+    let pair_index: HashMap<(&str, &str), usize> =
+        pairs.iter().enumerate().map(|(i, &p)| (p, i)).collect();
 
     let mut parent: Vec<usize> = (0..n).collect();
     let mut rank: Vec<usize> = vec![0; n];
@@ -142,7 +139,8 @@ fn apply_mailmap(
             None => continue,
         };
 
-        let canonical_indices = find_indices(&|_n, e| e.eq_ignore_ascii_case(&entry.canonical_email));
+        let canonical_indices =
+            find_indices(&|_n, e| e.eq_ignore_ascii_case(&entry.canonical_email));
 
         let commit_indices = match &entry.commit_name {
             Some(cname) => find_indices(&|n, e| {
@@ -190,5 +188,129 @@ fn union(parent: &mut [usize], rank: &mut [usize], i: usize, j: usize) {
     } else {
         parent[rj] = ri;
         rank[ri] += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity_map::{format_identity, MapGroup};
+
+    fn make_commit(name: &str, email: &str) -> Commit {
+        Commit {
+            author_name: name.into(),
+            author_email: email.into(),
+            group_id: 0,
+            lines_added: 0,
+            lines_removed: 0,
+            files_changed: 0,
+            timestamp: 0,
+            whitespace_added: 0,
+            whitespace_removed: 0,
+            files_added: 0,
+            files_deleted: 0,
+            files_renamed: 0,
+            is_merge: false,
+        }
+    }
+
+    #[test]
+    fn merge_empty() {
+        let (groups, assignments) = merge(&[], &IdentityMap::default(), &[]);
+        assert!(groups.is_empty());
+        assert!(assignments.is_empty());
+    }
+
+    #[test]
+    fn merge_single_author() {
+        let commits = vec![make_commit("Alice", "alice@x.com")];
+        let (groups, assignments) = merge(&commits, &IdentityMap::default(), &[]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].display_name, "Alice");
+        assert_eq!(assignments, vec![0]);
+    }
+
+    #[test]
+    fn merge_same_author_twice() {
+        let commits = vec![
+            make_commit("Alice", "alice@x.com"),
+            make_commit("Alice", "alice@x.com"),
+        ];
+        let (groups, assignments) = merge(&commits, &IdentityMap::default(), &[]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(assignments[0], assignments[1]);
+    }
+
+    #[test]
+    fn merge_auto_merge_same_email() {
+        let commits = vec![
+            make_commit("Alice Smith", "alice@x.com"),
+            make_commit("alice", "alice@x.com"),
+        ];
+        let (groups, assignments) = merge(&commits, &IdentityMap::default(), &[]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(assignments[0], assignments[1]);
+    }
+
+    #[test]
+    fn merge_distinct_authors() {
+        let commits = vec![
+            make_commit("Alice", "alice@x.com"),
+            make_commit("Bob", "bob@x.com"),
+        ];
+        let (groups, assignments) = merge(&commits, &IdentityMap::default(), &[]);
+        assert_eq!(groups.len(), 2);
+        assert_ne!(assignments[0], assignments[1]);
+    }
+
+    #[test]
+    fn merge_identity_map_merge() {
+        let commits = vec![
+            make_commit("Alice", "alice@work.com"),
+            make_commit("Alice", "alice@home.com"),
+        ];
+        let identity_map = IdentityMap {
+            group: vec![MapGroup {
+                name: "Alice".into(),
+                members: vec![
+                    format_identity("Alice", "alice@work.com"),
+                    format_identity("Alice", "alice@home.com"),
+                ],
+            }],
+            ..IdentityMap::default()
+        };
+        let (groups, assignments) = merge(&commits, &identity_map, &[]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(assignments[0], assignments[1]);
+    }
+
+    #[test]
+    fn merge_mailmap() {
+        let commits = vec![
+            make_commit("Old Name", "old@x.com"),
+            make_commit("New Name", "new@x.com"),
+        ];
+        let mailmap = vec![MailmapEntry {
+            canonical_name: Some("Canonical".into()),
+            canonical_email: "new@x.com".into(),
+            commit_name: None,
+            commit_email: Some("old@x.com".into()),
+        }];
+        let (groups, assignments) = merge(&commits, &IdentityMap::default(), &mailmap);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].display_name, "Canonical");
+        assert_eq!(assignments[0], assignments[1]);
+    }
+
+    #[test]
+    fn merge_assignment_validity() {
+        let commits = vec![
+            make_commit("Alice", "a@x.com"),
+            make_commit("Bob", "b@x.com"),
+            make_commit("Alice", "a@x.com"),
+        ];
+        let (groups, assignments) = merge(&commits, &IdentityMap::default(), &[]);
+        assert_eq!(assignments.len(), commits.len());
+        assert!(assignments.iter().all(|&i| i < groups.len()));
     }
 }

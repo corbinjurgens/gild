@@ -10,6 +10,13 @@ use rusqlite::params_from_iter;
 use std::cell::{Ref, RefCell};
 use std::path::PathBuf;
 
+const SESSION_GAP_SECS: i64 = 30 * 60;
+const GRAPH_TOP_N: usize = 8;
+const DETAIL_SCROLL_MAX: usize = 200;
+const SURROUND_PERIODS: i32 = 4;
+const QUARTERLY_THRESHOLD_DAYS: i64 = 730;
+const MONTHLY_THRESHOLD_DAYS: i64 = 120;
+
 #[derive(Clone)]
 pub struct AuthorStats {
     pub display_name: String,
@@ -30,9 +37,11 @@ pub struct AuthorStats {
 pub struct ChangeBreakdown {
     pub feature: usize,
     pub refactor: usize,
+    pub rename: usize,
     pub trivial: usize,
     pub new_files: usize,
     pub deleted_files: usize,
+    pub renamed_files: usize,
     pub whitespace_lines: usize,
     pub merge: usize,
 }
@@ -43,6 +52,7 @@ pub enum ViewMode {
     Graph,
     Detail,
     Files,
+    FileDetail,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -59,6 +69,14 @@ pub struct FileRow {
     pub unique_authors: Option<u32>,
     pub churn_score: Option<f64>,
     pub top_coupled: Option<(String, f64)>,
+}
+
+pub struct FileDetailData {
+    pub path: String,
+    pub commit_count: u32,
+    pub unique_authors: Option<u32>,
+    pub churn_score: Option<f64>,
+    pub coupled_files: Vec<(String, f64)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -82,6 +100,8 @@ pub struct FileEvent {
     pub path: String,
     pub timestamp: i64,
 }
+
+type GroupFiles = (Vec<(String, usize)>, Vec<FileEvent>, Vec<FileEvent>);
 
 pub struct TrendPoint {
     pub label: String,
@@ -226,10 +246,13 @@ pub struct App {
     pub total_authors: usize,
     pub filtered_commits: usize,
     pub has_ownership: bool,
+    pub has_commit_types: bool,
     pub has_files_view: bool,
     pub file_rows: Vec<FileRow>,
     pub file_sort: FileSortMode,
     pub file_selected: usize,
+    pub file_detail: Option<FileDetailData>,
+    pub file_detail_scroll: usize,
     pub theme: Theme,
     pub show_theme_picker: bool,
     pub questionnaire: Option<QuestionnaireState>,
@@ -260,10 +283,9 @@ impl App {
         db: Database,
     ) -> Self {
         let total_commits = commits.len();
-        let (earliest, latest) = commits.iter().fold(
-            (i64::MAX, i64::MIN),
-            |(lo, hi), c| (lo.min(c.timestamp), hi.max(c.timestamp)),
-        );
+        let (earliest, latest) = commits.iter().fold((i64::MAX, i64::MIN), |(lo, hi), c| {
+            (lo.min(c.timestamp), hi.max(c.timestamp))
+        });
         let earliest = if total_commits == 0 { 0 } else { earliest };
         let latest = if total_commits == 0 { 0 } else { latest };
 
@@ -280,10 +302,13 @@ impl App {
             total_authors: groups.len(),
             filtered_commits: total_commits,
             has_ownership: false,
+            has_commit_types: false,
             has_files_view: false,
             file_rows: Vec::new(),
             file_sort: FileSortMode::Commits,
             file_selected: 0,
+            file_detail: None,
+            file_detail_scroll: 0,
             theme: Theme::Normal,
             show_theme_picker: false,
             questionnaire: None,
@@ -328,16 +353,21 @@ impl App {
     fn sort_file_rows(&mut self) {
         match self.file_sort {
             FileSortMode::Commits => {
-                self.file_rows.sort_by(|a, b| b.commit_count.cmp(&a.commit_count));
+                self.file_rows
+                    .sort_by_key(|r| std::cmp::Reverse(r.commit_count));
             }
             FileSortMode::Authors => {
                 self.file_rows.sort_by(|a, b| {
-                    b.unique_authors.unwrap_or(0).cmp(&a.unique_authors.unwrap_or(0))
+                    b.unique_authors
+                        .unwrap_or(0)
+                        .cmp(&a.unique_authors.unwrap_or(0))
                 });
             }
             FileSortMode::Churn => {
                 self.file_rows.sort_by(|a, b| {
-                    b.churn_score.unwrap_or(0.0).partial_cmp(&a.churn_score.unwrap_or(0.0))
+                    b.churn_score
+                        .unwrap_or(0.0)
+                        .partial_cmp(&a.churn_score.unwrap_or(0.0))
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
             }
@@ -357,6 +387,41 @@ impl App {
             self.file_selected = 0;
             self.sort_file_rows();
         }
+    }
+
+    pub fn open_file_detail(&mut self) {
+        let row = match self.file_rows.get(self.file_selected) {
+            Some(r) => r,
+            None => return,
+        };
+
+        let path = row.path.clone();
+        let mut coupled_files = Vec::new();
+
+        if let Ok(mut stmt) = self.db.prepare(
+            "SELECT file_b, score FROM file_coupling WHERE file_a = ?1
+             UNION ALL
+             SELECT file_a, score FROM file_coupling WHERE file_b = ?1
+             ORDER BY score DESC",
+        ) {
+            if let Ok(rows) = stmt.query_map([&path], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+            }) {
+                for r in rows.flatten() {
+                    coupled_files.push(r);
+                }
+            }
+        }
+
+        self.file_detail = Some(FileDetailData {
+            path,
+            commit_count: row.commit_count,
+            unique_authors: row.unique_authors,
+            churn_score: row.churn_score,
+            coupled_files,
+        });
+        self.file_detail_scroll = 0;
+        self.view_mode = ViewMode::FileDetail;
     }
 
     fn recompute(&mut self) {
@@ -411,14 +476,14 @@ impl App {
             TimeMode::All => "All time".to_string(),
             TimeMode::Year => {
                 let year = ts_year(self.latest) + offset;
-                format!("{}", year)
+                format!("{year}")
             }
             TimeMode::Quarter => {
                 let dt = ts_to_dt(self.latest);
                 let ref_q_start = ((dt.month() - 1) / 3) * 3 + 1;
                 let (y, m) = offset_month(dt.year(), ref_q_start, offset * 3);
                 let q = (m - 1) / 3 + 1;
-                format!("{} Q{}", y, q)
+                format!("{y} Q{q}")
             }
             TimeMode::Month => {
                 let dt = ts_to_dt(self.latest);
@@ -456,7 +521,7 @@ impl App {
             TimeMode::All => String::new(),
             TimeMode::Year => {
                 let year = ts_year(self.latest) + offset;
-                format!("{}", year)
+                format!("{year}")
             }
             TimeMode::Quarter => {
                 let dt = ts_to_dt(self.latest);
@@ -464,9 +529,9 @@ impl App {
                 let (y, m) = offset_month(dt.year(), ref_q_start, offset * 3);
                 let q = (m - 1) / 3 + 1;
                 if m == 1 {
-                    format!("{}Q{}", y, q)
+                    format!("{y}Q{q}")
                 } else {
-                    format!("Q{}", q)
+                    format!("Q{q}")
                 }
             }
             TimeMode::Month => {
@@ -527,7 +592,7 @@ impl App {
     }
 
     fn set_sort(&mut self, mode: SortMode) {
-        if mode == SortMode::Ownership && !self.has_ownership {
+        if mode == SortMode::Ownership && !self.show_ownership() {
             return;
         }
         if self.sort_mode != mode {
@@ -543,7 +608,7 @@ impl App {
     }
 
     fn time_navigate(&mut self, delta: i32) {
-        if self.time_mode == TimeMode::All {
+        if !self.is_time_filtered() {
             return;
         }
         let new_offset = self.time_offset + delta;
@@ -557,7 +622,59 @@ impl App {
         self.recompute();
     }
 
+    /// True when the active time window includes the present — i.e. "All" or
+    /// offset == 0 for Year/Quarter/Month. Fields that only reflect the current
+    /// HEAD state (not historical) should gate their visibility on this.
+    /// Pattern: `pub fn show_X(&self) -> bool { self.has_X && self.is_current_window() }`
+    pub fn is_current_window(&self) -> bool {
+        self.time_mode == TimeMode::All || self.time_offset == 0
+    }
+
+    pub fn show_ownership(&self) -> bool {
+        self.has_ownership && self.is_current_window()
+    }
+
+    pub fn set_commit_types(&mut self) {
+        self.has_commit_types = true;
+    }
+
+    pub fn show_commit_types(&self) -> bool {
+        self.has_commit_types
+    }
+
+    pub fn supports_time_nav(&self) -> bool {
+        matches!(
+            self.view_mode,
+            ViewMode::Table | ViewMode::Graph | ViewMode::Detail
+        )
+    }
+
+    pub fn is_time_filtered(&self) -> bool {
+        self.time_mode != TimeMode::All
+    }
+
+    pub fn has_file_authors(&self) -> bool {
+        self.file_rows
+            .first()
+            .is_some_and(|r| r.unique_authors.is_some())
+    }
+
+    pub fn has_file_churn(&self) -> bool {
+        self.file_rows
+            .first()
+            .is_some_and(|r| r.churn_score.is_some())
+    }
+
+    pub fn has_file_coupling(&self) -> bool {
+        self.file_rows
+            .first()
+            .is_some_and(|r| r.top_coupled.is_some())
+    }
+
     fn ownership_for_gid(&self, gid: usize) -> (usize, f64) {
+        if !self.is_current_window() {
+            return (0, 0.0);
+        }
         let lines = self.ownership_per_group.get(gid).copied().unwrap_or(0);
         let pct = if self.ownership_total > 0 {
             lines as f64 / self.ownership_total as f64 * 100.0
@@ -603,7 +720,9 @@ impl App {
             let data = self.compute_detail_data(gid)?;
             *self.detail_cache.borrow_mut() = Some((gid, data));
         }
-        Some(Ref::map(self.detail_cache.borrow(), |o| &o.as_ref().unwrap().1))
+        Some(Ref::map(self.detail_cache.borrow(), |o| {
+            &o.as_ref().unwrap().1
+        }))
     }
 
     fn compute_detail_data(&self, gid: usize) -> Option<DetailData> {
@@ -622,7 +741,9 @@ impl App {
                     .checked_sub(1)
                     .and_then(|p| self.sorted_author_at(p))
                     .map(|a| a.display_name.clone());
-                let next = self.sorted_author_at(pos + 1).map(|a| a.display_name.clone());
+                let next = self
+                    .sorted_author_at(pos + 1)
+                    .map(|a| a.display_name.clone());
                 (prev, next)
             }
             None => (
@@ -672,12 +793,7 @@ impl App {
     ///
     /// File paths are not kept in memory; each detail-view open issues three
     /// short SQL queries scoped to the group's author emails and window.
-    fn query_group_files(
-        &self,
-        gid: usize,
-        start: i64,
-        end: i64,
-    ) -> rusqlite::Result<(Vec<(String, usize)>, Vec<FileEvent>, Vec<FileEvent>)> {
+    fn query_group_files(&self, gid: usize, start: i64, end: i64) -> rusqlite::Result<GroupFiles> {
         let mut emails: Vec<String> = self.groups[gid]
             .aliases
             .iter()
@@ -696,8 +812,7 @@ impl App {
             .collect::<Vec<_>>()
             .join(",");
 
-        let top_files =
-            self.query_top_files(&emails, &email_placeholders, start, end)?;
+        let top_files = self.query_top_files(&emails, &email_placeholders, start, end)?;
         let recent_added =
             self.query_recent_events(FILE_KIND_ADDED, &emails, &email_placeholders, start, end)?;
         let recent_deleted =
@@ -718,13 +833,12 @@ impl App {
              FROM commit_files cf
              JOIN commits c ON c.hash = cf.commit_hash
              WHERE cf.kind = ?1 AND c.timestamp >= ?2 AND c.timestamp < ?3
-               AND c.author_email IN ({})
+               AND c.author_email IN ({email_placeholders})
              GROUP BY cf.file_path
              ORDER BY ct DESC, cf.file_path ASC
-             LIMIT 20",
-            email_placeholders
+             LIMIT 20"
         );
-        let mut stmt = self.db.conn.prepare(&sql)?;
+        let mut stmt = self.db.prepare(&sql)?;
         let args = bind_args(FILE_KIND_TOUCHED, start, end, emails);
         let mut rows = stmt.query(params_from_iter(args.iter()))?;
         let mut out = Vec::with_capacity(20);
@@ -749,12 +863,11 @@ impl App {
              FROM commit_files cf
              JOIN commits c ON c.hash = cf.commit_hash
              WHERE cf.kind = ?1 AND c.timestamp >= ?2 AND c.timestamp < ?3
-               AND c.author_email IN ({})
+               AND c.author_email IN ({email_placeholders})
              ORDER BY c.timestamp DESC
-             LIMIT 200",
-            email_placeholders
+             LIMIT 200"
         );
-        let mut stmt = self.db.conn.prepare(&sql)?;
+        let mut stmt = self.db.prepare(&sql)?;
         let args = bind_args(kind, start, end, emails);
         let mut rows = stmt.query(params_from_iter(args.iter()))?;
         let mut seen = std::collections::HashSet::<String>::new();
@@ -776,7 +889,7 @@ impl App {
     }
 
     fn compute_trend(&self, gid: usize) -> Vec<TrendPoint> {
-        if self.time_mode == TimeMode::All {
+        if !self.is_time_filtered() {
             return Vec::new();
         }
 
@@ -796,7 +909,13 @@ impl App {
             .commits
             .iter()
             .filter(|c| c.group_id == gid)
-            .map(|c| (c.timestamp, c.lines_added + c.lines_removed, c.files_changed))
+            .map(|c| {
+                (
+                    c.timestamp,
+                    c.lines_added + c.lines_removed,
+                    c.files_changed,
+                )
+            })
             .collect();
         author_commits.sort_by_key(|&(ts, _, _)| ts);
 
@@ -936,6 +1055,10 @@ impl App {
             return self.handle_detail_key(key);
         }
 
+        if self.view_mode == ViewMode::FileDetail {
+            return self.handle_file_detail_key(key);
+        }
+
         if self.view_mode == ViewMode::Files {
             return self.handle_files_key(key);
         }
@@ -955,14 +1078,12 @@ impl App {
                 self.view_mode = match self.view_mode {
                     ViewMode::Table => ViewMode::Graph,
                     ViewMode::Graph => ViewMode::Table,
-                    ViewMode::Detail | ViewMode::Files => ViewMode::Table,
+                    ViewMode::Detail | ViewMode::Files | ViewMode::FileDetail => ViewMode::Table,
                 };
             }
-            KeyCode::Char('V') => {
-                if self.has_files_view {
-                    self.view_mode = ViewMode::Files;
-                    self.file_selected = 0;
-                }
+            KeyCode::Char('V') if self.has_files_view => {
+                self.view_mode = ViewMode::Files;
+                self.file_selected = 0;
             }
             KeyCode::Char('t') => self.set_time_mode(self.time_mode.next()),
             KeyCode::Left | KeyCode::Char('[') => self.time_navigate(-1),
@@ -970,9 +1091,7 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j')
-                if self.selected + 1 < self.authors.len() =>
-            {
+            KeyCode::Down | KeyCode::Char('j') if self.selected + 1 < self.authors.len() => {
                 self.selected += 1;
             }
             KeyCode::Home => self.selected = 0,
@@ -1083,6 +1202,7 @@ impl App {
                 self.view_mode = ViewMode::Table;
             }
             KeyCode::Char('q') => return true,
+            KeyCode::Enter => self.open_file_detail(),
             KeyCode::Up | KeyCode::Char('k') => {
                 self.file_selected = self.file_selected.saturating_sub(1);
             }
@@ -1097,6 +1217,43 @@ impl App {
             KeyCode::Char('a') => self.set_file_sort(FileSortMode::Authors),
             KeyCode::Char('h') => self.set_file_sort(FileSortMode::Churn),
             KeyCode::Char('p') => self.set_file_sort(FileSortMode::Coupling),
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_file_detail_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc | KeyCode::Backspace => {
+                self.file_detail = None;
+                self.view_mode = ViewMode::Files;
+            }
+            KeyCode::Char('q') => return true,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.file_detail_scroll = self.file_detail_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max = self
+                    .file_detail
+                    .as_ref()
+                    .map(|d| d.coupled_files.len().saturating_sub(1))
+                    .unwrap_or(0);
+                if self.file_detail_scroll < max {
+                    self.file_detail_scroll += 1;
+                }
+            }
+            KeyCode::PageUp => {
+                self.file_detail_scroll = self.file_detail_scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                let max = self
+                    .file_detail
+                    .as_ref()
+                    .map(|d| d.coupled_files.len().saturating_sub(1))
+                    .unwrap_or(0);
+                self.file_detail_scroll = (self.file_detail_scroll + 10).min(max);
+            }
+            KeyCode::Home => self.file_detail_scroll = 0,
             _ => {}
         }
         false
@@ -1125,7 +1282,11 @@ impl App {
         ];
 
         let (raw_start, raw_end) = self.time_bounds();
-        let start = if raw_start == 0 { self.earliest } else { raw_start };
+        let start = if raw_start == 0 {
+            self.earliest
+        } else {
+            raw_start
+        };
         let end = if raw_end == i64::MAX {
             self.latest + SECONDS_PER_DAY
         } else {
@@ -1238,15 +1399,12 @@ fn offset_month(year: i32, month: u32, offset: i32) -> (i32, u32) {
 
 fn month_ts(year: i32, month: u32) -> i64 {
     chrono::NaiveDate::from_ymd_opt(year, month, 1)
-        .unwrap()
+        .expect("month always 1..=12 from offset_month")
         .and_hms_opt(0, 0, 0)
-        .unwrap()
+        .expect("midnight is always valid")
         .and_utc()
         .timestamp()
 }
-
-const QUARTERLY_THRESHOLD_DAYS: i64 = 730;
-const MONTHLY_THRESHOLD_DAYS: i64 = 120;
 
 fn period_boundaries(start: i64, end: i64) -> (Vec<i64>, Vec<String>) {
     let span_days = (end - start) / SECONDS_PER_DAY;
@@ -1283,7 +1441,7 @@ fn quarterly_iter(start: i64) -> impl Iterator<Item = (i64, String)> {
     std::iter::from_fn(move || {
         let ts = month_ts(y, m);
         let q = (m - 1) / 3 + 1;
-        let label = format!("{}Q{}", y, q);
+        let label = format!("{y}Q{q}");
         (y, m) = offset_month(y, m, 3);
         Some((ts, label))
     })
@@ -1315,24 +1473,16 @@ fn weekly_iter(start: i64) -> impl Iterator<Item = (i64, String)> {
     })
 }
 
-const SESSION_GAP_SECS: i64 = 30 * 60;
-const GRAPH_TOP_N: usize = 8;
-const DETAIL_SCROLL_MAX: usize = 200;
-const SURROUND_PERIODS: i32 = 4;
-
+#[derive(Debug, PartialEq)]
 enum ChangeKind {
     Feature,
     Refactor,
+    Rename,
     Trivial,
     Merge,
 }
 
-fn bind_args(
-    kind: i64,
-    start: i64,
-    end: i64,
-    emails: &[String],
-) -> Vec<rusqlite::types::Value> {
+fn bind_args(kind: i64, start: i64, end: i64, emails: &[String]) -> Vec<rusqlite::types::Value> {
     use rusqlite::types::Value;
     let mut args = Vec::with_capacity(3 + emails.len());
     args.push(Value::Integer(kind));
@@ -1355,8 +1505,17 @@ fn classify_commit(c: &Commit) -> ChangeKind {
     let is_trivial = total_lines <= 5 && c.files_changed <= 1;
 
     if is_whitespace_only || is_trivial {
-        ChangeKind::Trivial
-    } else if c.files_added > 0 && c.files_deleted == 0 {
+        return ChangeKind::Trivial;
+    }
+
+    if c.files_renamed > 0 {
+        let file_ops = c.files_added + c.files_deleted + c.files_renamed;
+        if c.files_renamed * 2 >= file_ops && total_lines <= c.files_renamed * 20 {
+            return ChangeKind::Rename;
+        }
+    }
+
+    if c.files_added > 0 && c.files_deleted == 0 {
         ChangeKind::Feature
     } else if c.files_deleted > 0 && c.files_added == 0 {
         ChangeKind::Refactor
@@ -1383,9 +1542,11 @@ fn aggregate_group(gid: usize, sorted: &[&Commit], display_name: &str) -> Author
         change_types.whitespace_lines += c.whitespace_added + c.whitespace_removed;
         change_types.new_files += c.files_added;
         change_types.deleted_files += c.files_deleted;
+        change_types.renamed_files += c.files_renamed;
         match classify_commit(c) {
             ChangeKind::Feature => change_types.feature += 1,
             ChangeKind::Refactor => change_types.refactor += 1,
+            ChangeKind::Rename => change_types.rename += 1,
             ChangeKind::Trivial => change_types.trivial += 1,
             ChangeKind::Merge => change_types.merge += 1,
         }
@@ -1415,13 +1576,18 @@ fn compute_impact(sorted_commits: &[&Commit]) -> f64 {
     let mut total_lines = 0usize;
     let mut total_ws = 0usize;
     let mut total_files = 0usize;
+    let mut merge_files = 0usize;
     let mut sessions = 1usize;
     let mut last_ts = sorted_commits[0].timestamp;
 
     for c in sorted_commits {
         total_lines += c.lines_added + c.lines_removed;
         total_ws += c.whitespace_added + c.whitespace_removed;
-        total_files += c.files_changed;
+        if c.is_merge {
+            merge_files += c.files_changed;
+        } else {
+            total_files += c.files_changed;
+        }
         if c.timestamp - last_ts > SESSION_GAP_SECS {
             sessions += 1;
         }
@@ -1432,13 +1598,255 @@ fn compute_impact(sorted_commits: &[&Commit]) -> f64 {
     let ws_contribution = total_ws as f64 * 0.1;
     let effective_lines = substantive_lines as f64 + ws_contribution;
 
-    // Uses `files_changed` sum (matches session_value calls in graph/trend)
-    // rather than unique-file-count — the latter would require a DB query
-    // on every window change.
-    let substance = session_value(effective_lines as usize, total_files);
+    let effective_files = total_files as f64 + merge_files as f64 * 0.1;
+    let substance = session_value(effective_lines as usize, effective_files as usize);
     substance * (1.0 + 0.15 * (sessions as f64).ln())
 }
 
 fn session_value(lines: usize, files: usize) -> f64 {
     (1.0 + (1.0 + lines as f64).ln()) * (1.0 + 0.5 * (1.0 + files as f64).ln())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::Commit;
+
+    fn assert_approx(got: f64, expected: f64) {
+        assert!(
+            (got - expected).abs() < 1e-6,
+            "got {got}, expected {expected}"
+        );
+    }
+
+    fn make_commit(
+        lines_added: usize,
+        lines_removed: usize,
+        files_changed: usize,
+        timestamp: i64,
+        is_merge: bool,
+    ) -> Commit {
+        Commit {
+            author_name: "Test".into(),
+            author_email: "test@example.com".into(),
+            group_id: 0,
+            lines_added,
+            lines_removed,
+            files_changed,
+            timestamp,
+            whitespace_added: 0,
+            whitespace_removed: 0,
+            files_added: 0,
+            files_deleted: 0,
+            files_renamed: 0,
+            is_merge,
+        }
+    }
+
+    fn make_classify_input(
+        lines_added: usize,
+        lines_removed: usize,
+        files_changed: usize,
+        whitespace_added: usize,
+        whitespace_removed: usize,
+        files_added: usize,
+        files_deleted: usize,
+        files_renamed: usize,
+        is_merge: bool,
+    ) -> Commit {
+        Commit {
+            author_name: "Test".into(),
+            author_email: "test@example.com".into(),
+            group_id: 0,
+            timestamp: 0,
+            lines_added,
+            lines_removed,
+            files_changed,
+            whitespace_added,
+            whitespace_removed,
+            files_added,
+            files_deleted,
+            files_renamed,
+            is_merge,
+        }
+    }
+
+    fn make_author(commits: usize, trivial: usize) -> AuthorStats {
+        AuthorStats {
+            display_name: String::new(),
+            group_id: 0,
+            commits,
+            lines_added: 0,
+            lines_removed: 0,
+            files_changed: 0,
+            first_commit: 0,
+            last_commit: 0,
+            impact: 0.0,
+            ownership_lines: 0,
+            ownership_pct: 0.0,
+            change_types: ChangeBreakdown {
+                trivial,
+                ..ChangeBreakdown::default()
+            },
+        }
+    }
+
+    // --- noise_pct ---
+
+    #[test]
+    fn noise_pct_zero_commits() {
+        assert_approx(noise_pct(&make_author(0, 0)), 0.0);
+    }
+
+    #[test]
+    fn noise_pct_no_trivial() {
+        assert_approx(noise_pct(&make_author(10, 0)), 0.0);
+    }
+
+    #[test]
+    fn noise_pct_all_trivial() {
+        assert_approx(noise_pct(&make_author(1, 1)), 100.0);
+    }
+
+    #[test]
+    fn noise_pct_mixed() {
+        assert_approx(noise_pct(&make_author(10, 3)), 30.0);
+    }
+
+    // --- session_value ---
+
+    #[test]
+    fn session_value_zeros() {
+        assert_approx(session_value(0, 0), 1.0);
+    }
+
+    #[test]
+    fn session_value_lines_only() {
+        assert_approx(session_value(1, 0), 1.0 + 2.0_f64.ln());
+    }
+
+    #[test]
+    fn session_value_both() {
+        let expected = (1.0 + 11.0_f64.ln()) * (1.0 + 0.5 * 3.0_f64.ln());
+        assert_approx(session_value(10, 2), expected);
+    }
+
+    // --- classify_commit ---
+
+    #[test]
+    fn classify_merge() {
+        let c = make_classify_input(100, 50, 10, 0, 0, 5, 2, 0, true);
+        assert_eq!(classify_commit(&c), ChangeKind::Merge);
+    }
+
+    #[test]
+    fn classify_trivial_whitespace_only() {
+        let c = make_classify_input(5, 5, 3, 5, 5, 0, 0, 0, false);
+        assert_eq!(classify_commit(&c), ChangeKind::Trivial);
+    }
+
+    #[test]
+    fn classify_trivial_small() {
+        let c = make_classify_input(3, 2, 1, 0, 0, 0, 0, 0, false);
+        assert_eq!(classify_commit(&c), ChangeKind::Trivial);
+    }
+
+    #[test]
+    fn classify_trivial_empty() {
+        let c = make_classify_input(0, 0, 0, 0, 0, 0, 0, 0, false);
+        assert_eq!(classify_commit(&c), ChangeKind::Trivial);
+    }
+
+    #[test]
+    fn classify_rename() {
+        let c = make_classify_input(15, 15, 4, 0, 0, 0, 0, 2, false);
+        assert_eq!(classify_commit(&c), ChangeKind::Rename);
+    }
+
+    #[test]
+    fn classify_rename_too_many_lines() {
+        let c = make_classify_input(21, 0, 2, 0, 0, 0, 0, 1, false);
+        assert_ne!(classify_commit(&c), ChangeKind::Rename);
+    }
+
+    #[test]
+    fn classify_feature_new_files() {
+        let c = make_classify_input(20, 0, 3, 0, 0, 1, 0, 0, false);
+        assert_eq!(classify_commit(&c), ChangeKind::Feature);
+    }
+
+    #[test]
+    fn classify_refactor_deleted_files() {
+        let c = make_classify_input(0, 20, 2, 0, 0, 0, 1, 0, false);
+        assert_eq!(classify_commit(&c), ChangeKind::Refactor);
+    }
+
+    #[test]
+    fn classify_feature_high_add_ratio() {
+        let c = make_classify_input(9, 3, 3, 0, 0, 0, 0, 0, false);
+        assert_eq!(classify_commit(&c), ChangeKind::Feature);
+    }
+
+    #[test]
+    fn classify_refactor_low_add_ratio() {
+        let c = make_classify_input(3, 3, 3, 0, 0, 0, 0, 0, false);
+        assert_eq!(classify_commit(&c), ChangeKind::Refactor);
+    }
+
+    // --- compute_impact ---
+
+    #[test]
+    fn impact_empty() {
+        let commits: Vec<&Commit> = vec![];
+        assert_approx(compute_impact(&commits), 0.0);
+    }
+
+    #[test]
+    fn impact_single_commit() {
+        let c = make_commit(10, 0, 3, 1000, false);
+        let expected = session_value(10, 3);
+        assert_approx(compute_impact(&[&c]), expected);
+    }
+
+    #[test]
+    fn impact_same_session() {
+        let c1 = make_commit(5, 0, 1, 0, false);
+        let c2 = make_commit(5, 0, 1, 1000, false);
+        let one_session = session_value(10, 2) * 1.0;
+        assert_approx(compute_impact(&[&c1, &c2]), one_session);
+    }
+
+    #[test]
+    fn impact_boundary_not_new_session() {
+        let c1 = make_commit(5, 0, 1, 0, false);
+        let c2 = make_commit(5, 0, 1, SESSION_GAP_SECS, false);
+        let one_session = session_value(10, 2);
+        assert_approx(compute_impact(&[&c1, &c2]), one_session);
+    }
+
+    #[test]
+    fn impact_boundary_new_session() {
+        let c1 = make_commit(5, 0, 1, 0, false);
+        let c2 = make_commit(5, 0, 1, SESSION_GAP_SECS + 1, false);
+        let two_sessions = session_value(10, 2) * (1.0 + 0.15 * 2.0_f64.ln());
+        assert_approx(compute_impact(&[&c1, &c2]), two_sessions);
+    }
+
+    #[test]
+    fn impact_whitespace_discount() {
+        let mut c = make_commit(10, 10, 2, 0, false);
+        c.whitespace_added = 10;
+        c.whitespace_removed = 10;
+        let effective_lines = (0.0 + 20.0 * 0.1) as usize; // 2
+        let expected = session_value(effective_lines, 2);
+        assert_approx(compute_impact(&[&c]), expected);
+    }
+
+    #[test]
+    fn impact_merge_file_discount() {
+        let c = make_commit(0, 0, 10, 0, true);
+        let effective_files = (10.0 * 0.1) as usize; // 1
+        let expected = session_value(0, effective_files);
+        assert_approx(compute_impact(&[&c]), expected);
+    }
 }

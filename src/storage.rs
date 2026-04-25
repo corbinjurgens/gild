@@ -1,5 +1,5 @@
 use anyhow::Result;
-use git2::Repository;
+use gix::bstr::ByteSlice;
 use std::path::{Path, PathBuf};
 
 pub enum RepoKey {
@@ -18,11 +18,12 @@ pub fn data_dir() -> PathBuf {
 }
 
 pub fn resolve_repo_key(repo_path: &Path) -> Result<RepoKey> {
-    let repo = Repository::open(repo_path)?;
-    if let Ok(remote) = repo.find_remote("origin") {
-        if let Some(url) = remote.url() {
+    let repo = gix::open(repo_path)?;
+    if let Some(Ok(remote)) = repo.find_default_remote(gix::remote::Direction::Fetch) {
+        if let Some(url) = remote.url(gix::remote::Direction::Fetch) {
+            let url_str = url.to_bstring().to_str_lossy().into_owned();
             return Ok(RepoKey::Remote {
-                normalized_url: crate::remote::normalize_url(url),
+                normalized_url: crate::remote::normalize_url(&url_str),
             });
         }
     }
@@ -35,7 +36,7 @@ pub fn resolve_repo_key(repo_path: &Path) -> Result<RepoKey> {
         .unwrap_or_else(|| "repo".into());
     let hash = fnv1a_hex8(canonical.to_string_lossy().as_bytes());
     Ok(RepoKey::Local {
-        folder_label: format!("{}-{}", folder, hash),
+        folder_label: format!("{folder}-{hash}"),
     })
 }
 
@@ -65,6 +66,6 @@ fn fnv1a_hex8(bytes: &[u8]) -> String {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
-    let hex = format!("{:016x}", h);
+    let hex = format!("{h:016x}");
     hex.chars().take(8).collect()
 }

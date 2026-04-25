@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
-use git2::build::RepoBuilder;
-use git2::{Cred, CredentialType, FetchOptions, RemoteCallbacks, Repository};
-use std::cell::Cell;
+use gix::bstr::ByteSlice;
+use gix::credentials::{helper, protocol};
 use std::path::{Path, PathBuf};
 
 pub fn is_remote_url(input: &str) -> bool {
@@ -15,11 +14,11 @@ pub fn is_remote_url(input: &str) -> bool {
 pub fn ensure_repo(url: &str) -> Result<PathBuf> {
     let local_path = clone_dir_for_url(url);
 
-    if local_path.join(".git").exists() || local_path.join("HEAD").exists() {
-        if Repository::open(&local_path).is_ok() {
-            fetch_repo(&local_path, url)?;
-            return Ok(local_path);
-        }
+    if (local_path.join(".git").exists() || local_path.join("HEAD").exists())
+        && gix::open(&local_path).is_ok()
+    {
+        fetch_repo(&local_path, url)?;
+        return Ok(local_path);
     }
 
     clone_repo(url, &local_path)?;
@@ -62,18 +61,30 @@ pub fn normalize_url(url: &str) -> String {
 }
 
 fn clone_repo(url: &str, dest: &Path) -> Result<()> {
-    eprintln!("  Cloning {}...", url);
+    eprintln!("  Cloning {url}...");
 
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create cache directory: {}", parent.display()))?;
     }
 
-    let fetch_opts = make_fetch_options();
-    RepoBuilder::new()
-        .fetch_options(fetch_opts)
-        .clone(url, dest)
+    let mut clone = gix::prepare_clone(url, dest)?;
+    if let Some(credentials) = env_credentials() {
+        let mut credentials = Some(credentials);
+        clone = clone.configure_connection(move |conn| {
+            if let Some(c) = credentials.take() {
+                conn.set_credentials(c);
+            }
+            Ok(())
+        });
+    }
+    let (mut checkout, _) = clone
+        .fetch_then_checkout(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
         .with_context(|| auth_error_hint(url))?;
+
+    checkout
+        .main_worktree(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
+        .context("Failed to checkout working tree")?;
 
     eprintln!("  Clone complete.");
     Ok(())
@@ -82,29 +93,32 @@ fn clone_repo(url: &str, dest: &Path) -> Result<()> {
 fn fetch_repo(local_path: &Path, url: &str) -> Result<()> {
     eprintln!("  Fetching updates...");
 
-    let repo = Repository::open(local_path)
-        .context("Failed to open cached repository")?;
+    let repo = gix::open(local_path).context("Failed to open cached repository")?;
 
-    let mut remote = repo
+    let remote = repo
         .find_remote("origin")
-        .or_else(|_| repo.remote_anonymous(url))
         .context("No remote 'origin' found")?;
 
-    let mut fetch_opts = make_fetch_options();
-    remote
-        .fetch(&[] as &[&str], Some(&mut fetch_opts), None)
+    let mut conn = remote.connect(gix::remote::Direction::Fetch)?;
+    if let Some(credentials) = env_credentials() {
+        conn.set_credentials(credentials);
+    }
+    conn.prepare_fetch(gix::progress::Discard, Default::default())?
+        .receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
         .with_context(|| auth_error_hint(url))?;
 
-    // Update HEAD to track remote default branch
-    if let Ok(head) = remote.default_branch() {
-        if let Some(refname) = head.as_str() {
-            let _ = repo.set_head(refname);
-            // Fast-forward working tree to match
-            if let Ok(reference) = repo.find_reference(refname) {
-                if let Ok(commit) = reference.peel_to_commit() {
-                    let _ = repo.checkout_tree(
-                        commit.as_object(),
-                        Some(git2::build::CheckoutBuilder::new().force()),
+    // Fast-forward local branch to match its remote tracking counterpart.
+    if let Ok(Some(head_ref)) = repo.head_ref() {
+        let name = head_ref.name().as_bstr().to_str_lossy().into_owned();
+        if let Some(branch) = name.strip_prefix("refs/heads/") {
+            let tracking = format!("refs/remotes/origin/{branch}");
+            if let Ok(remote_ref) = repo.find_reference(&tracking) {
+                if let Ok(target) = remote_ref.into_fully_peeled_id() {
+                    let _ = repo.reference(
+                        name.as_str(),
+                        target.detach(),
+                        gix::refs::transaction::PreviousValue::Any,
+                        "gild: fast-forward after fetch",
                     );
                 }
             }
@@ -114,85 +128,125 @@ fn fetch_repo(local_path: &Path, url: &str) -> Result<()> {
     Ok(())
 }
 
-fn make_fetch_options<'a>() -> FetchOptions<'a> {
-    let mut callbacks = RemoteCallbacks::new();
-    let attempts = Cell::new(0usize);
+fn env_token() -> Option<String> {
+    ["GILD_TOKEN", "GIT_TOKEN", "GITHUB_TOKEN"]
+        .iter()
+        .find_map(|var| std::env::var(var).ok())
+}
 
-    callbacks.credentials(move |url, username_from_url, allowed_types| {
-        let attempt = attempts.get();
-        if attempt >= 4 {
-            return Err(git2::Error::from_str("authentication failed after multiple attempts"));
+fn env_credentials() -> Option<impl FnMut(helper::Action) -> protocol::Result> {
+    let token = env_token()?;
+    Some(move |action| match action {
+        helper::Action::Get(_) => {
+            let identity = gix::sec::identity::Account {
+                username: "x-access-token".into(),
+                password: token.clone(),
+                oauth_refresh_token: None,
+            };
+            Ok(Some(protocol::Outcome {
+                identity,
+                next: helper::NextAction::from(protocol::Context::default()),
+            }))
         }
-        attempts.set(attempt + 1);
-
-        let username = username_from_url.unwrap_or("git");
-
-        if allowed_types.contains(CredentialType::SSH_KEY) {
-            if let Ok(cred) = Cred::ssh_key_from_agent(username) {
-                return Ok(cred);
-            }
-
-            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-            let ssh_dir = home.join(".ssh");
-            for key_name in &["id_ed25519", "id_rsa", "id_ecdsa"] {
-                let key_path = ssh_dir.join(key_name);
-                if key_path.exists() {
-                    if let Ok(cred) = Cred::ssh_key(username, None, &key_path, None) {
-                        return Ok(cred);
-                    }
-                }
-            }
-        }
-
-        if allowed_types.contains(CredentialType::USER_PASS_PLAINTEXT) {
-            if let Ok(config) = git2::Config::open_default() {
-                if let Ok(cred) = Cred::credential_helper(&config, url, username_from_url) {
-                    return Ok(cred);
-                }
-            }
-
-            for var in &["GILD_TOKEN", "GIT_TOKEN", "GITHUB_TOKEN"] {
-                if let Ok(token) = std::env::var(var) {
-                    return Cred::userpass_plaintext(username, &token);
-                }
-            }
-        }
-
-        if allowed_types.contains(CredentialType::USERNAME) {
-            return Cred::username(username);
-        }
-
-        Err(git2::Error::from_str("no authentication method available"))
-    });
-
-    callbacks.transfer_progress(|stats| {
-        if stats.total_objects() > 0 {
-            eprint!(
-                "\r  Cloning... {}/{} objects",
-                stats.received_objects(),
-                stats.total_objects()
-            );
-        }
-        true
-    });
-
-    let mut fetch_opts = FetchOptions::new();
-    fetch_opts.remote_callbacks(callbacks);
-    fetch_opts
+        helper::Action::Store(_) | helper::Action::Erase(_) => Ok(None),
+    })
 }
 
 fn auth_error_hint(url: &str) -> String {
     if url.starts_with("git@") || url.starts_with("ssh://") {
         format!(
-            "Failed to access {}. For SSH repos, ensure ssh-agent is running \
-             and your key is added (ssh-add).",
-            url
+            "Failed to access {url}. For SSH repos, ensure ssh-agent is running \
+             and your key is added (ssh-add)."
         )
     } else {
         format!(
-            "Failed to access {}. For private repos, configure a git credential \
-             helper or set GILD_TOKEN / GITHUB_TOKEN.",
-            url
+            "Failed to access {url}. For private repos, configure a git credential \
+             helper or set GILD_TOKEN / GITHUB_TOKEN."
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scp_style() {
+        assert_eq!(
+            normalize_url("git@github.com:user/repo.git"),
+            "github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn scp_no_suffix() {
+        assert_eq!(
+            normalize_url("git@github.com:user/repo"),
+            "github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn https_dotgit() {
+        assert_eq!(
+            normalize_url("https://github.com/user/repo.git"),
+            "github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn https_clean() {
+        assert_eq!(
+            normalize_url("https://github.com/user/repo"),
+            "github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn trailing_slash() {
+        assert_eq!(
+            normalize_url("https://github.com/user/repo/"),
+            "github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn uppercase() {
+        assert_eq!(
+            normalize_url("HTTPS://GITHUB.COM/USER/REPO"),
+            "github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn ssh_scheme() {
+        assert_eq!(
+            normalize_url("ssh://git@github.com/user/repo.git"),
+            "github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn userinfo_token() {
+        assert_eq!(
+            normalize_url("https://token@github.com/user/repo"),
+            "github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn userinfo_user_pass() {
+        assert_eq!(
+            normalize_url("https://u:p@github.com/user/repo"),
+            "github.com/user/repo"
+        );
+    }
+
+    #[test]
+    fn no_scheme() {
+        assert_eq!(
+            normalize_url("github.com/user/repo"),
+            "github.com/user/repo"
+        );
     }
 }

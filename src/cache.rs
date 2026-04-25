@@ -23,10 +23,10 @@ pub struct Cache {
 impl Cache {
     pub fn load(db: &Database) -> Result<Self> {
         let mut loaded = HashMap::new();
-        let mut stmt = db.conn.prepare(
+        let mut stmt = db.prepare(
             "SELECT hash, author_name, author_email, lines_added, lines_removed,
                     files_changed, timestamp, whitespace_added, whitespace_removed,
-                    files_added, files_deleted, is_merge
+                    files_added, files_deleted, is_merge, files_renamed
              FROM commits",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -45,6 +45,7 @@ impl Cache {
                     whitespace_removed: row.get::<_, i64>(8)? as usize,
                     files_added: row.get::<_, i64>(9)? as usize,
                     files_deleted: row.get::<_, i64>(10)? as usize,
+                    files_renamed: row.get::<_, i64>(12)? as usize,
                     is_merge: row.get::<_, i64>(11)? != 0,
                 },
             ))
@@ -65,14 +66,14 @@ impl Cache {
         if !self.dirty {
             return Ok(());
         }
-        let tx = db.conn.unchecked_transaction()?;
+        let tx = db.transaction()?;
         {
             let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO commits (
                     hash, author_name, author_email, lines_added, lines_removed,
                     files_changed, timestamp, whitespace_added, whitespace_removed,
-                    files_added, files_deleted, is_merge
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                    files_added, files_deleted, is_merge, files_renamed
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             )?;
             for (hash, c) in self.staged_commits.drain() {
                 stmt.execute(params![
@@ -88,6 +89,7 @@ impl Cache {
                     c.files_added as i64,
                     c.files_deleted as i64,
                     c.is_merge as i64,
+                    c.files_renamed as i64,
                 ])?;
             }
         }
@@ -118,6 +120,10 @@ impl Cache {
             .get(hash)
             .cloned()
             .or_else(|| self.loaded.get(hash).cloned())
+    }
+
+    pub fn staged_count(&self) -> usize {
+        self.staged_commits.len()
     }
 
     pub fn insert(&mut self, hash: String, commit: Commit, files: CommitFiles) {

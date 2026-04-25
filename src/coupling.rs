@@ -17,7 +17,7 @@ const MIN_CO_OCCURRENCES: u32 = 3;
 const MIN_SCORE: f64 = 0.1;
 
 fn cache_key(db: &Database, head_hash: &str) -> Result<String> {
-    let (count, max_ts): (i64, i64) = db.conn.query_row(
+    let (count, max_ts): (i64, i64) = db.query_row(
         "SELECT COUNT(*), COALESCE(MAX(timestamp), 0) FROM commits",
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -25,7 +25,7 @@ fn cache_key(db: &Database, head_hash: &str) -> Result<String> {
     // head_hash is part of the key so that `file_stats.current_lines` (set by
     // churn using HEAD's `walk_tree_sizes`) is never shown under a different
     // HEAD than the one that produced it.
-    Ok(format!("n={},ts={},head={}", count, max_ts, head_hash))
+    Ok(format!("n={count},ts={max_ts},head={head_hash}"))
 }
 
 pub fn compute(
@@ -36,7 +36,6 @@ pub fn compute(
     let key = cache_key(db, head_hash)?;
 
     let cached_count: i64 = db
-        .conn
         .query_row(
             "SELECT COUNT(*) FROM file_stats WHERE cache_key = ?1",
             params![&key],
@@ -48,9 +47,8 @@ pub fn compute(
     }
 
     let total_commits: i64 = db
-        .conn
         .query_row(
-            "SELECT COUNT(*) FROM commits WHERE files_changed <= ?1",
+            "SELECT COUNT(*) FROM commits WHERE files_changed <= ?1 AND is_merge = 0",
             params![MAX_FILES_PER_COMMIT],
             |r| r.get(0),
         )
@@ -58,21 +56,23 @@ pub fn compute(
     let total_commits = total_commits.max(0) as usize;
     on_progress(0, total_commits);
 
-    let mut file_counts: HashMap<String, u32> = HashMap::new();
-    let mut co_occur: HashMap<(String, String), u32> = HashMap::new();
+    let mut intern: HashMap<String, u32> = HashMap::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut file_counts: HashMap<u32, u32> = HashMap::new();
+    let mut co_occur: HashMap<(u32, u32), u32> = HashMap::new();
 
     {
-        let mut stmt = db.conn.prepare(
+        let mut stmt = db.prepare(
             "SELECT cf.commit_hash, cf.file_path
              FROM commit_files cf
              JOIN commits c ON c.hash = cf.commit_hash
-             WHERE cf.kind = ?1 AND c.files_changed <= ?2
+             WHERE cf.kind = ?1 AND c.files_changed <= ?2 AND c.is_merge = 0
              ORDER BY cf.commit_hash",
         )?;
         let mut rows = stmt.query(params![FILE_KIND_TOUCHED, MAX_FILES_PER_COMMIT])?;
 
         let mut current_hash: Option<String> = None;
-        let mut current_files: Vec<String> = Vec::new();
+        let mut current_files: Vec<u32> = Vec::new();
         let mut processed = 0usize;
 
         while let Some(row) = rows.next()? {
@@ -89,7 +89,16 @@ pub fn compute(
                 current_hash = Some(hash);
                 current_files.clear();
             }
-            current_files.push(path);
+            let id = match intern.get(&path) {
+                Some(&id) => id,
+                None => {
+                    let id = names.len() as u32;
+                    intern.insert(path.clone(), id);
+                    names.push(path);
+                    id
+                }
+            };
+            current_files.push(id);
         }
         if current_hash.is_some() {
             accumulate(&current_files, &mut file_counts, &mut co_occur);
@@ -98,26 +107,26 @@ pub fn compute(
         on_progress(processed, total_commits);
     }
 
-    persist(db, &key, &file_counts, &co_occur)?;
+    persist(db, &key, &names, &file_counts, &co_occur)?;
     load_from_db(db, &key)
 }
 
 fn accumulate(
-    files: &[String],
-    file_counts: &mut HashMap<String, u32>,
-    co_occur: &mut HashMap<(String, String), u32>,
+    files: &[u32],
+    file_counts: &mut HashMap<u32, u32>,
+    co_occur: &mut HashMap<(u32, u32), u32>,
 ) {
-    for f in files {
-        *file_counts.entry(f.clone()).or_insert(0) += 1;
+    for &f in files {
+        *file_counts.entry(f).or_insert(0) += 1;
     }
     for j in 0..files.len() {
         for k in (j + 1)..files.len() {
-            let (a, b) = if files[j] <= files[k] {
-                (files[j].clone(), files[k].clone())
+            let pair = if files[j] <= files[k] {
+                (files[j], files[k])
             } else {
-                (files[k].clone(), files[j].clone())
+                (files[k], files[j])
             };
-            *co_occur.entry((a, b)).or_insert(0) += 1;
+            *co_occur.entry(pair).or_insert(0) += 1;
         }
     }
 }
@@ -125,10 +134,11 @@ fn accumulate(
 fn persist(
     db: &Database,
     key: &str,
-    file_counts: &HashMap<String, u32>,
-    co_occur: &HashMap<(String, String), u32>,
+    names: &[String],
+    file_counts: &HashMap<u32, u32>,
+    co_occur: &HashMap<(u32, u32), u32>,
 ) -> Result<()> {
-    let tx = db.conn.unchecked_transaction()?;
+    let tx = db.transaction()?;
     tx.execute("DELETE FROM file_stats WHERE cache_key != ?1", params![key])?;
     tx.execute("DELETE FROM file_coupling", [])?;
 
@@ -137,8 +147,8 @@ fn persist(
             "INSERT OR REPLACE INTO file_stats (file, commit_count, cache_key)
              VALUES (?1, ?2, ?3)",
         )?;
-        for (file, &count) in file_counts {
-            stmt.execute(params![file, count as i64, key])?;
+        for (&id, &count) in file_counts {
+            stmt.execute(params![&names[id as usize], count as i64, key])?;
         }
     }
     {
@@ -146,17 +156,17 @@ fn persist(
             "INSERT OR REPLACE INTO file_coupling (file_a, file_b, co_occurrences, score)
              VALUES (?1, ?2, ?3, ?4)",
         )?;
-        for ((file_a, file_b), &co) in co_occur {
+        for (&(id_a, id_b), &co) in co_occur {
             if co < MIN_CO_OCCURRENCES {
                 continue;
             }
-            let ca = *file_counts.get(file_a).unwrap_or(&1) as f64;
-            let cb = *file_counts.get(file_b).unwrap_or(&1) as f64;
+            let ca = *file_counts.get(&id_a).unwrap_or(&1) as f64;
+            let cb = *file_counts.get(&id_b).unwrap_or(&1) as f64;
             let score = co as f64 / ca.min(cb);
             if score < MIN_SCORE {
                 continue;
             }
-            stmt.execute(params![file_a, file_b, co as i64, score])?;
+            stmt.execute(params![&names[id_a as usize], &names[id_b as usize], co as i64, score])?;
         }
     }
     tx.commit()?;
@@ -166,9 +176,8 @@ fn persist(
 fn load_from_db(db: &Database, key: &str) -> Result<Vec<FileCouplingRow>> {
     let mut file_counts: HashMap<String, u32> = HashMap::new();
     {
-        let mut stmt = db.conn.prepare(
-            "SELECT file, commit_count FROM file_stats WHERE cache_key = ?1",
-        )?;
+        let mut stmt =
+            db.prepare("SELECT file, commit_count FROM file_stats WHERE cache_key = ?1")?;
         let rows = stmt.query_map(params![key], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
         })?;
@@ -180,9 +189,8 @@ fn load_from_db(db: &Database, key: &str) -> Result<Vec<FileCouplingRow>> {
 
     let mut best_partner: HashMap<String, (String, f64)> = HashMap::new();
     {
-        let mut stmt = db.conn.prepare(
-            "SELECT file_a, file_b, score FROM file_coupling ORDER BY score DESC",
-        )?;
+        let mut stmt =
+            db.prepare("SELECT file_a, file_b, score FROM file_coupling ORDER BY score DESC")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -211,6 +219,6 @@ fn load_from_db(db: &Database, key: &str) -> Result<Vec<FileCouplingRow>> {
         })
         .collect();
 
-    results.sort_by(|a, b| b.commit_count.cmp(&a.commit_count));
+    results.sort_by_key(|r| std::cmp::Reverse(r.commit_count));
     Ok(results)
 }

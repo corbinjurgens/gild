@@ -1,23 +1,18 @@
 use anyhow::Result;
-use git2::Repository;
 use rusqlite::params;
 use std::collections::HashSet;
 use std::path::Path;
 
 use crate::db::Database;
 
-/// Prune DB rows keyed to commits or HEADs that are no longer reachable from
-/// any ref in the working repository. Runs at startup; revwalk + a handful
-/// of DELETEs. Keeps the caches scoped to the repo's current live history so
-/// no add-on ever aggregates over dead/force-pushed commits.
 pub fn run(repo_path: &Path, db: &Database) -> Result<()> {
-    let repo = match Repository::open(repo_path) {
+    let repo = match gix::open(repo_path) {
         Ok(r) => r,
-        Err(_) => return Ok(()), // caller handles repo-open failures later
+        Err(_) => return Ok(()),
     };
     let reachable = reachable_commits(&repo)?;
 
-    let tx = db.conn.unchecked_transaction()?;
+    let tx = db.transaction()?;
     tx.execute(
         "CREATE TEMP TABLE IF NOT EXISTS _gc_reachable (hash TEXT PRIMARY KEY)",
         [],
@@ -71,31 +66,28 @@ pub fn run(repo_path: &Path, db: &Database) -> Result<()> {
     Ok(())
 }
 
-fn reachable_commits(repo: &Repository) -> Result<HashSet<String>> {
-    let mut walk = repo.revwalk()?;
-
-    // Push every ref (branches + remotes + tags). `revwalk` de-duplicates
-    // commits reached via multiple refs, so one walk covers all of them.
+fn reachable_commits(repo: &gix::Repository) -> Result<HashSet<String>> {
+    let mut tips: Vec<gix::ObjectId> = Vec::new();
     if let Ok(refs) = repo.references() {
-        for reference in refs.flatten() {
-            if let Ok(resolved) = reference.resolve() {
-                if let Some(oid) = resolved.target() {
-                    let _ = walk.push(oid);
+        if let Ok(all) = refs.all() {
+            for reference in all.flatten() {
+                if let Ok(id) = reference.into_fully_peeled_id() {
+                    tips.push(id.detach());
                 }
             }
         }
     }
-    // Detached HEAD isn't in references(); push it explicitly.
     if let Ok(head) = repo.head() {
-        if let Some(oid) = head.target() {
-            let _ = walk.push(oid);
+        if let Ok(id) = head.into_peeled_id() {
+            tips.push(id.detach());
         }
     }
 
     let mut reachable = HashSet::new();
-    for oid_res in walk {
-        if let Ok(oid) = oid_res {
-            reachable.insert(oid.to_string());
+    if !tips.is_empty() {
+        let walk = repo.rev_walk(tips).all()?;
+        for info in walk.flatten() {
+            reachable.insert(info.id.to_string());
         }
     }
     Ok(reachable)
