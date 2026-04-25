@@ -1,4 +1,4 @@
-use crate::util::load_or_default;
+use crate::storage::load_or_default;
 use std::convert::Infallible;
 use std::path::Path;
 

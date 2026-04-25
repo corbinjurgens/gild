@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::db::Database;
 
-pub fn run(repo_path: &Path, db: &Database) -> Result<()> {
+pub fn run(repo_path: &Path, db: &mut Database) -> Result<()> {
     let repo = match gix::open(repo_path) {
         Ok(r) => r,
         Err(_) => return Ok(()),

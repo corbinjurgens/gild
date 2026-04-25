@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 use std::collections::HashMap;
 
-use crate::db::{Database, FILE_KIND_TOUCHED};
+use crate::db::{file_addon_cache_key, Database, FILE_KIND_TOUCHED};
 
 pub struct ChurnRow {
     pub file: String,
@@ -10,24 +10,13 @@ pub struct ChurnRow {
     pub churn_score: f64,
 }
 
-fn cache_key(db: &Database, head_hash: &str) -> Result<String> {
-    let (count, max_ts): (i64, i64) = db.query_row(
-        "SELECT COUNT(*), COALESCE(MAX(timestamp), 0) FROM commits",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    // Matches coupling's key: head_hash ties `current_lines` (computed from
-    // HEAD's tree) to the specific HEAD it was measured at.
-    Ok(format!("n={count},ts={max_ts},head={head_hash}"))
-}
-
 pub fn compute(
     repo: &gix::Repository,
-    db: &Database,
+    db: &mut Database,
     head_hash: &str,
     on_progress: impl Fn(usize, usize),
 ) -> Result<Vec<ChurnRow>> {
-    let key = cache_key(db, head_hash)?;
+    let key = file_addon_cache_key(db, head_hash)?;
 
     let has_churn: i64 = db
         .query_row(
@@ -59,7 +48,7 @@ pub fn compute(
         let rows = stmt.query_map(params![&key], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
         })?;
-        rows.filter_map(|r| r.ok()).collect()
+        rows.collect::<std::result::Result<_, _>>()?
     } else {
         let mut stmt = db.prepare(
             "SELECT cf.file_path, COUNT(*)
@@ -71,7 +60,8 @@ pub fn compute(
         let rows = stmt.query_map(params![FILE_KIND_TOUCHED], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
         })?;
-        rows.filter_map(|r| r.ok())
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
             .filter(|(file, _)| file_sizes.contains_key(file))
             .collect()
     };

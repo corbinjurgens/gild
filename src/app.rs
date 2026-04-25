@@ -11,7 +11,6 @@ use std::cell::{Ref, RefCell};
 use std::path::PathBuf;
 
 const SESSION_GAP_SECS: i64 = 30 * 60;
-const GRAPH_TOP_N: usize = 8;
 const DETAIL_SCROLL_MAX: usize = 200;
 const SURROUND_PERIODS: i32 = 4;
 const QUARTERLY_THRESHOLD_DAYS: i64 = 730;
@@ -85,6 +84,7 @@ pub enum Theme {
     Readable,
 }
 
+#[derive(Clone)]
 pub struct GraphRow {
     pub name: String,
     pub data: Vec<u64>,
@@ -200,6 +200,13 @@ impl TimeMode {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum OwnershipPresence {
+    Absent,
+    Stale,
+    Current,
+}
+
 pub fn noise_pct(author: &AuthorStats) -> f64 {
     if author.commits == 0 {
         0.0
@@ -233,43 +240,59 @@ pub struct QuestionnaireState {
     pub last_action: Option<&'static str>,
 }
 
-pub struct App {
-    pub authors: Vec<AuthorStats>,
-    pub sort_mode: SortMode,
-    pub time_mode: TimeMode,
-    pub time_offset: i32,
-    pub view_mode: ViewMode,
-    pub selected: usize,
-    pub detail_scroll: usize,
+pub struct AppData {
+    pub commits: Vec<Commit>,
+    pub groups: Vec<IdentityGroup>,
     pub repo_info: RepoInfo,
     pub total_commits: usize,
     pub total_authors: usize,
-    pub filtered_commits: usize,
-    pub has_ownership: bool,
+    pub identity_map: IdentityMap,
+    pub identity_map_path: PathBuf,
+    pub mailmap_entries: Vec<MailmapEntry>,
+    pub ownership_per_group: Vec<usize>,
+    pub ownership_total: usize,
+    pub earliest: i64,
+    pub latest: i64,
+    pub db: Database,
+    pub file_rows: Vec<FileRow>,
+    pub ownership: OwnershipPresence,
     pub has_commit_types: bool,
     pub has_files_view: bool,
-    pub file_rows: Vec<FileRow>,
-    pub file_sort: FileSortMode,
-    pub file_selected: usize,
-    pub file_detail: Option<FileDetailData>,
-    pub file_detail_scroll: usize,
+    pub has_file_authors: bool,
+    pub has_file_churn: bool,
+    pub has_file_coupling: bool,
+}
+
+pub struct AppView {
+    pub view_mode: ViewMode,
+    pub selected: usize,
+    pub detail_scroll: usize,
+    pub sort_mode: SortMode,
+    pub time_mode: TimeMode,
+    pub time_offset: i32,
     pub theme: Theme,
     pub show_theme_picker: bool,
+    pub file_sort: FileSortMode,
+    pub file_selected: usize,
+    pub file_detail_scroll: usize,
+    pub detail_group_id: Option<usize>,
+    pub detail_position: Option<usize>,
     pub questionnaire: Option<QuestionnaireState>,
-    detail_group_id: Option<usize>,
-    sorted_indices: Vec<usize>,
-    graph_cache: RefCell<Option<GraphData>>,
-    detail_cache: RefCell<Option<(usize, DetailData)>>,
-    commits: Vec<Commit>,
-    groups: Vec<IdentityGroup>,
-    identity_map: IdentityMap,
-    identity_map_path: PathBuf,
-    mailmap_entries: Vec<MailmapEntry>,
-    ownership_per_group: Vec<usize>,
-    ownership_total: usize,
-    earliest: i64,
-    latest: i64,
-    db: Database,
+}
+
+pub struct AppCache {
+    pub authors: Vec<AuthorStats>,
+    pub filtered_commits: usize,
+    pub sorted_indices: Vec<usize>,
+    pub graph_cache: RefCell<Option<GraphData>>,
+    pub detail_cache: RefCell<Option<(usize, DetailData)>>,
+    pub file_detail: Option<FileDetailData>,
+}
+
+pub struct App {
+    pub data: AppData,
+    pub view: AppView,
+    pub cache: AppCache,
 }
 
 impl App {
@@ -283,6 +306,7 @@ impl App {
         db: Database,
     ) -> Self {
         let total_commits = commits.len();
+        let total_authors = groups.len();
         let (earliest, latest) = commits.iter().fold((i64::MAX, i64::MIN), |(lo, hi), c| {
             (lo.min(c.timestamp), hi.max(c.timestamp))
         });
@@ -290,81 +314,99 @@ impl App {
         let latest = if total_commits == 0 { 0 } else { latest };
 
         let mut app = Self {
-            authors: Vec::new(),
-            sort_mode: SortMode::Impact,
-            time_mode: TimeMode::Year,
-            time_offset: 0,
-            view_mode: ViewMode::Table,
-            selected: 0,
-            detail_scroll: 0,
-            repo_info: info,
-            total_commits,
-            total_authors: groups.len(),
-            filtered_commits: total_commits,
-            has_ownership: false,
-            has_commit_types: false,
-            has_files_view: false,
-            file_rows: Vec::new(),
-            file_sort: FileSortMode::Commits,
-            file_selected: 0,
-            file_detail: None,
-            file_detail_scroll: 0,
-            theme: Theme::Normal,
-            show_theme_picker: false,
-            questionnaire: None,
-            detail_group_id: None,
-            sorted_indices: Vec::new(),
-            graph_cache: RefCell::new(None),
-            detail_cache: RefCell::new(None),
-            commits,
-            groups,
-            identity_map,
-            identity_map_path,
-            mailmap_entries,
-            ownership_per_group: Vec::new(),
-            ownership_total: 0,
-            earliest,
-            latest,
-            db,
+            data: AppData {
+                commits,
+                groups,
+                repo_info: info,
+                total_commits,
+                total_authors,
+                identity_map,
+                identity_map_path,
+                mailmap_entries,
+                ownership_per_group: Vec::new(),
+                ownership_total: 0,
+                earliest,
+                latest,
+                db,
+                file_rows: Vec::new(),
+                ownership: OwnershipPresence::Absent,
+                has_commit_types: false,
+                has_files_view: false,
+                has_file_authors: false,
+                has_file_churn: false,
+                has_file_coupling: false,
+            },
+            view: AppView {
+                view_mode: ViewMode::Table,
+                selected: 0,
+                detail_scroll: 0,
+                sort_mode: SortMode::Impact,
+                time_mode: TimeMode::Year,
+                time_offset: 0,
+                theme: Theme::Normal,
+                show_theme_picker: false,
+                file_sort: FileSortMode::Commits,
+                file_selected: 0,
+                file_detail_scroll: 0,
+                detail_group_id: None,
+                detail_position: None,
+                questionnaire: None,
+            },
+            cache: AppCache {
+                authors: Vec::new(),
+                filtered_commits: total_commits,
+                sorted_indices: Vec::new(),
+                graph_cache: RefCell::new(None),
+                detail_cache: RefCell::new(None),
+                file_detail: None,
+            },
         };
         app.recompute();
         app
     }
 
     pub fn groups(&self) -> &[IdentityGroup] {
-        &self.groups
+        &self.data.groups
     }
 
     pub fn set_ownership(&mut self, per_group: Vec<usize>, total: usize) {
-        self.ownership_per_group = per_group;
-        self.ownership_total = total;
-        self.has_ownership = total > 0;
+        self.data.ownership_per_group = per_group;
+        self.data.ownership_total = total;
+        self.data.ownership = if total > 0 {
+            OwnershipPresence::Current
+        } else {
+            OwnershipPresence::Absent
+        };
         self.recompute();
     }
 
     pub fn set_file_data(&mut self, rows: Vec<FileRow>) {
-        self.file_rows = rows;
-        self.file_sort = FileSortMode::Commits;
-        self.file_selected = 0;
-        self.has_files_view = !self.file_rows.is_empty();
+        self.data.has_file_authors = rows.iter().any(|r| r.unique_authors.is_some());
+        self.data.has_file_churn = rows.iter().any(|r| r.churn_score.is_some());
+        self.data.has_file_coupling = rows.iter().any(|r| r.top_coupled.is_some());
+        self.data.file_rows = rows;
+        self.view.file_sort = FileSortMode::Commits;
+        self.view.file_selected = 0;
+        self.data.has_files_view = !self.data.file_rows.is_empty();
         self.sort_file_rows();
     }
 
     fn sort_file_rows(&mut self) {
-        match self.file_sort {
+        match self.view.file_sort {
             FileSortMode::Commits => {
-                self.file_rows
+                self.data
+                    .file_rows
                     .sort_by_key(|r| std::cmp::Reverse(r.commit_count));
             }
             FileSortMode::Authors => {
-                self.file_rows.sort_by(|a, b| {
+                self.data.file_rows.sort_by(|a, b| {
                     b.unique_authors
                         .unwrap_or(0)
                         .cmp(&a.unique_authors.unwrap_or(0))
                 });
             }
             FileSortMode::Churn => {
-                self.file_rows.sort_by(|a, b| {
+                self.data.file_rows.sort_by(|a, b| {
                     b.churn_score
                         .unwrap_or(0.0)
                         .partial_cmp(&a.churn_score.unwrap_or(0.0))
@@ -372,7 +414,7 @@ impl App {
                 });
             }
             FileSortMode::Coupling => {
-                self.file_rows.sort_by(|a, b| {
+                self.data.file_rows.sort_by(|a, b| {
                     let sa = a.top_coupled.as_ref().map(|(_, s)| *s).unwrap_or(0.0);
                     let sb = b.top_coupled.as_ref().map(|(_, s)| *s).unwrap_or(0.0);
                     sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
@@ -382,15 +424,15 @@ impl App {
     }
 
     pub fn set_file_sort(&mut self, mode: FileSortMode) {
-        if self.file_sort != mode {
-            self.file_sort = mode;
-            self.file_selected = 0;
+        if self.view.file_sort != mode {
+            self.view.file_sort = mode;
+            self.view.file_selected = 0;
             self.sort_file_rows();
         }
     }
 
     pub fn open_file_detail(&mut self) {
-        let row = match self.file_rows.get(self.file_selected) {
+        let row = match self.data.file_rows.get(self.view.file_selected) {
             Some(r) => r,
             None => return,
         };
@@ -398,7 +440,7 @@ impl App {
         let path = row.path.clone();
         let mut coupled_files = Vec::new();
 
-        if let Ok(mut stmt) = self.db.prepare(
+        if let Ok(mut stmt) = self.data.db.prepare(
             "SELECT file_b, score FROM file_coupling WHERE file_a = ?1
              UNION ALL
              SELECT file_a, score FROM file_coupling WHERE file_b = ?1
@@ -413,24 +455,24 @@ impl App {
             }
         }
 
-        self.file_detail = Some(FileDetailData {
+        self.cache.file_detail = Some(FileDetailData {
             path,
             commit_count: row.commit_count,
             unique_authors: row.unique_authors,
             churn_score: row.churn_score,
             coupled_files,
         });
-        self.file_detail_scroll = 0;
-        self.view_mode = ViewMode::FileDetail;
+        self.view.file_detail_scroll = 0;
+        self.view.view_mode = ViewMode::FileDetail;
     }
 
     fn recompute(&mut self) {
         let (start, end) = self.time_bounds();
 
         let mut group_data: Vec<Vec<&Commit>> =
-            (0..self.groups.len()).map(|_| Vec::new()).collect();
+            (0..self.data.groups.len()).map(|_| Vec::new()).collect();
 
-        for entry in &self.commits {
+        for entry in &self.data.commits {
             if entry.timestamp < start || entry.timestamp >= end {
                 continue;
             }
@@ -447,7 +489,7 @@ impl App {
 
             data.sort_by_key(|c| c.timestamp);
 
-            let author_stats = aggregate_group(gid, data, &self.groups[gid].display_name);
+            let author_stats = aggregate_group(gid, data, &self.data.groups[gid].display_name);
             total += author_stats.commits;
 
             let (ownership_lines, ownership_pct) = self.ownership_for_gid(gid);
@@ -458,35 +500,35 @@ impl App {
             });
         }
 
-        self.authors = authors;
-        self.filtered_commits = total;
+        self.cache.authors = authors;
+        self.cache.filtered_commits = total;
         self.resort();
     }
 
     pub fn time_bounds(&self) -> (i64, i64) {
-        self.bounds_for_offset(self.time_offset)
+        self.bounds_for_offset(self.view.time_offset)
     }
 
     pub fn time_label(&self) -> String {
-        self.label_for_offset(self.time_offset)
+        self.label_for_offset(self.view.time_offset)
     }
 
     fn label_for_offset(&self, offset: i32) -> String {
-        match self.time_mode {
+        match self.view.time_mode {
             TimeMode::All => "All time".to_string(),
             TimeMode::Year => {
-                let year = ts_year(self.latest) + offset;
+                let year = ts_year(self.data.latest) + offset;
                 format!("{year}")
             }
             TimeMode::Quarter => {
-                let dt = ts_to_dt(self.latest);
+                let dt = ts_to_dt(self.data.latest);
                 let ref_q_start = ((dt.month() - 1) / 3) * 3 + 1;
                 let (y, m) = offset_month(dt.year(), ref_q_start, offset * 3);
                 let q = (m - 1) / 3 + 1;
                 format!("{y} Q{q}")
             }
             TimeMode::Month => {
-                let dt = ts_to_dt(self.latest);
+                let dt = ts_to_dt(self.data.latest);
                 let (y, m) = offset_month(dt.year(), dt.month(), offset);
                 format!("{} {}", MONTHS[(m - 1) as usize], y)
             }
@@ -494,21 +536,21 @@ impl App {
     }
 
     fn bounds_for_offset(&self, offset: i32) -> (i64, i64) {
-        match self.time_mode {
+        match self.view.time_mode {
             TimeMode::All => (0, i64::MAX),
             TimeMode::Year => {
-                let year = ts_year(self.latest) + offset;
+                let year = ts_year(self.data.latest) + offset;
                 (month_ts(year, 1), month_ts(year + 1, 1))
             }
             TimeMode::Quarter => {
-                let dt = ts_to_dt(self.latest);
+                let dt = ts_to_dt(self.data.latest);
                 let ref_q_start = ((dt.month() - 1) / 3) * 3 + 1;
                 let (y, m) = offset_month(dt.year(), ref_q_start, offset * 3);
                 let (ny, nm) = offset_month(y, m, 3);
                 (month_ts(y, m), month_ts(ny, nm))
             }
             TimeMode::Month => {
-                let dt = ts_to_dt(self.latest);
+                let dt = ts_to_dt(self.data.latest);
                 let (y, m) = offset_month(dt.year(), dt.month(), offset);
                 let (ny, nm) = offset_month(y, m, 1);
                 (month_ts(y, m), month_ts(ny, nm))
@@ -517,14 +559,14 @@ impl App {
     }
 
     fn short_label_for_offset(&self, offset: i32) -> String {
-        match self.time_mode {
+        match self.view.time_mode {
             TimeMode::All => String::new(),
             TimeMode::Year => {
-                let year = ts_year(self.latest) + offset;
+                let year = ts_year(self.data.latest) + offset;
                 format!("{year}")
             }
             TimeMode::Quarter => {
-                let dt = ts_to_dt(self.latest);
+                let dt = ts_to_dt(self.data.latest);
                 let ref_q_start = ((dt.month() - 1) / 3) * 3 + 1;
                 let (y, m) = offset_month(dt.year(), ref_q_start, offset * 3);
                 let q = (m - 1) / 3 + 1;
@@ -535,7 +577,7 @@ impl App {
                 }
             }
             TimeMode::Month => {
-                let dt = ts_to_dt(self.latest);
+                let dt = ts_to_dt(self.data.latest);
                 let (y, m) = offset_month(dt.year(), dt.month(), offset);
                 let show_year = m == 1 || {
                     let (py, _) = offset_month(dt.year(), dt.month(), offset - 1);
@@ -552,58 +594,64 @@ impl App {
 
     fn has_earlier_data(&self) -> bool {
         let (start, _) = self.time_bounds();
-        start > self.earliest
+        start > self.data.earliest
     }
 
     pub fn sorted_authors(
         &self,
     ) -> impl ExactSizeIterator<Item = &AuthorStats> + DoubleEndedIterator + Clone + '_ {
-        self.sorted_indices.iter().map(|&i| &self.authors[i])
+        self.cache
+            .sorted_indices
+            .iter()
+            .map(|&i| &self.cache.authors[i])
     }
 
     pub fn sorted_author_at(&self, pos: usize) -> Option<&AuthorStats> {
-        self.sorted_indices.get(pos).map(|&i| &self.authors[i])
+        self.cache
+            .sorted_indices
+            .get(pos)
+            .map(|&i| &self.cache.authors[i])
     }
 
     pub fn sorted_author_count(&self) -> usize {
-        self.sorted_indices.len()
+        self.cache.sorted_indices.len()
     }
 
     pub fn overall_time_range(&self) -> (i64, i64) {
-        (self.earliest, self.latest)
+        (self.data.earliest, self.data.latest)
     }
 
     fn resort(&mut self) {
-        self.sorted_indices = (0..self.authors.len()).collect();
-        let authors = &self.authors;
-        let sort_mode = self.sort_mode;
-        self.sorted_indices.sort_by(|&a, &b| {
+        self.cache.sorted_indices = (0..self.cache.authors.len()).collect();
+        let authors = &self.cache.authors;
+        let sort_mode = self.view.sort_mode;
+        self.cache.sorted_indices.sort_by(|&a, &b| {
             let va = sort_value_for(sort_mode, &authors[a]);
             let vb = sort_value_for(sort_mode, &authors[b]);
             vb.cmp(&va)
         });
-        self.selected = 0;
+        self.view.selected = 0;
         self.invalidate_caches();
     }
 
     fn invalidate_caches(&mut self) {
-        self.graph_cache.get_mut().take();
-        self.detail_cache.get_mut().take();
+        self.cache.graph_cache.get_mut().take();
+        self.cache.detail_cache.get_mut().take();
     }
 
     fn set_sort(&mut self, mode: SortMode) {
         if mode == SortMode::Ownership && !self.show_ownership() {
             return;
         }
-        if self.sort_mode != mode {
-            self.sort_mode = mode;
+        if self.view.sort_mode != mode {
+            self.view.sort_mode = mode;
             self.resort();
         }
     }
 
     pub fn set_time_mode(&mut self, mode: TimeMode) {
-        self.time_mode = mode;
-        self.time_offset = 0;
+        self.view.time_mode = mode;
+        self.view.time_offset = 0;
         self.recompute();
     }
 
@@ -611,73 +659,63 @@ impl App {
         if !self.is_time_filtered() {
             return;
         }
-        let new_offset = self.time_offset + delta;
+        let new_offset = self.view.time_offset + delta;
         if delta < 0 && !self.has_earlier_data() {
             return;
         }
         if delta > 0 && new_offset > 0 {
             return;
         }
-        self.time_offset = new_offset;
+        self.view.time_offset = new_offset;
         self.recompute();
     }
 
-    /// True when the active time window includes the present — i.e. "All" or
-    /// offset == 0 for Year/Quarter/Month. Fields that only reflect the current
-    /// HEAD state (not historical) should gate their visibility on this.
-    /// Pattern: `pub fn show_X(&self) -> bool { self.has_X && self.is_current_window() }`
     pub fn is_current_window(&self) -> bool {
-        self.time_mode == TimeMode::All || self.time_offset == 0
+        self.view.time_mode == TimeMode::All || self.view.time_offset == 0
     }
 
     pub fn show_ownership(&self) -> bool {
-        self.has_ownership && self.is_current_window()
+        self.data.ownership == OwnershipPresence::Current && self.is_current_window()
     }
 
     pub fn set_commit_types(&mut self) {
-        self.has_commit_types = true;
+        self.data.has_commit_types = true;
     }
 
     pub fn show_commit_types(&self) -> bool {
-        self.has_commit_types
+        self.data.has_commit_types
     }
 
     pub fn supports_time_nav(&self) -> bool {
         matches!(
-            self.view_mode,
+            self.view.view_mode,
             ViewMode::Table | ViewMode::Graph | ViewMode::Detail
         )
     }
 
     pub fn is_time_filtered(&self) -> bool {
-        self.time_mode != TimeMode::All
+        self.view.time_mode != TimeMode::All
     }
 
     pub fn has_file_authors(&self) -> bool {
-        self.file_rows
-            .first()
-            .is_some_and(|r| r.unique_authors.is_some())
+        self.data.has_file_authors
     }
 
     pub fn has_file_churn(&self) -> bool {
-        self.file_rows
-            .first()
-            .is_some_and(|r| r.churn_score.is_some())
+        self.data.has_file_churn
     }
 
     pub fn has_file_coupling(&self) -> bool {
-        self.file_rows
-            .first()
-            .is_some_and(|r| r.top_coupled.is_some())
+        self.data.has_file_coupling
     }
 
     fn ownership_for_gid(&self, gid: usize) -> (usize, f64) {
         if !self.is_current_window() {
             return (0, 0.0);
         }
-        let lines = self.ownership_per_group.get(gid).copied().unwrap_or(0);
-        let pct = if self.ownership_total > 0 {
-            lines as f64 / self.ownership_total as f64 * 100.0
+        let lines = self.data.ownership_per_group.get(gid).copied().unwrap_or(0);
+        let pct = if self.data.ownership_total > 0 {
+            lines as f64 / self.data.ownership_total as f64 * 100.0
         } else {
             0.0
         };
@@ -687,7 +725,7 @@ impl App {
     fn empty_author(&self, gid: usize) -> AuthorStats {
         let (ownership_lines, ownership_pct) = self.ownership_for_gid(gid);
         AuthorStats {
-            display_name: self.groups[gid].display_name.clone(),
+            display_name: self.data.groups[gid].display_name.clone(),
             group_id: gid,
             commits: 0,
             lines_added: 0,
@@ -703,14 +741,15 @@ impl App {
     }
 
     pub fn detail_data(&self) -> Option<Ref<'_, DetailData>> {
-        if self.view_mode != ViewMode::Detail {
+        if self.view.view_mode != ViewMode::Detail {
             return None;
         }
-        let gid = self.detail_group_id?;
-        if gid >= self.groups.len() {
+        let gid = self.view.detail_group_id?;
+        if gid >= self.data.groups.len() {
             return None;
         }
         let cache_hit = self
+            .cache
             .detail_cache
             .borrow()
             .as_ref()
@@ -718,22 +757,23 @@ impl App {
             .unwrap_or(false);
         if !cache_hit {
             let data = self.compute_detail_data(gid)?;
-            *self.detail_cache.borrow_mut() = Some((gid, data));
+            *self.cache.detail_cache.borrow_mut() = Some((gid, data));
         }
-        Some(Ref::map(self.detail_cache.borrow(), |o| {
+        Some(Ref::map(self.cache.detail_cache.borrow(), |o| {
             &o.as_ref().unwrap().1
         }))
     }
 
     fn compute_detail_data(&self, gid: usize) -> Option<DetailData> {
         let author = self
+            .cache
             .authors
             .iter()
             .find(|a| a.group_id == gid)
             .cloned()
             .unwrap_or_else(|| self.empty_author(gid));
 
-        let aliases = self.groups[gid].aliases.clone();
+        let aliases = self.data.groups[gid].aliases.clone();
 
         let (prev_name, next_name) = match self.sorted_authors().position(|a| a.group_id == gid) {
             Some(pos) => {
@@ -756,7 +796,7 @@ impl App {
         let (start, end) = self.time_bounds();
 
         let mut activity = [[0usize; 24]; 7];
-        for entry in &self.commits {
+        for entry in &self.data.commits {
             if entry.group_id != gid {
                 continue;
             }
@@ -794,7 +834,7 @@ impl App {
     /// File paths are not kept in memory; each detail-view open issues three
     /// short SQL queries scoped to the group's author emails and window.
     fn query_group_files(&self, gid: usize, start: i64, end: i64) -> rusqlite::Result<GroupFiles> {
-        let mut emails: Vec<String> = self.groups[gid]
+        let mut emails: Vec<String> = self.data.groups[gid]
             .aliases
             .iter()
             .map(|(_, e)| e.clone())
@@ -838,7 +878,7 @@ impl App {
              ORDER BY ct DESC, cf.file_path ASC
              LIMIT 20"
         );
-        let mut stmt = self.db.prepare(&sql)?;
+        let mut stmt = self.data.db.prepare(&sql)?;
         let args = bind_args(FILE_KIND_TOUCHED, start, end, emails);
         let mut rows = stmt.query(params_from_iter(args.iter()))?;
         let mut out = Vec::with_capacity(20);
@@ -867,7 +907,7 @@ impl App {
              ORDER BY c.timestamp DESC
              LIMIT 200"
         );
-        let mut stmt = self.db.prepare(&sql)?;
+        let mut stmt = self.data.db.prepare(&sql)?;
         let args = bind_args(kind, start, end, emails);
         let mut rows = stmt.query(params_from_iter(args.iter()))?;
         let mut seen = std::collections::HashSet::<String>::new();
@@ -895,9 +935,9 @@ impl App {
 
         let periods: Vec<(i64, i64, String, bool)> = (-SURROUND_PERIODS..=SURROUND_PERIODS)
             .filter_map(|delta| {
-                let virtual_offset = self.time_offset + delta;
+                let virtual_offset = self.view.time_offset + delta;
                 let (s, e) = self.bounds_for_offset(virtual_offset);
-                if e <= self.earliest || s >= self.latest + SECONDS_PER_DAY {
+                if e <= self.data.earliest || s >= self.data.latest + SECONDS_PER_DAY {
                     return None;
                 }
                 let label = self.short_label_for_offset(virtual_offset);
@@ -906,6 +946,7 @@ impl App {
             .collect();
 
         let mut author_commits: Vec<(i64, usize, usize)> = self
+            .data
             .commits
             .iter()
             .filter(|c| c.group_id == gid)
@@ -934,7 +975,8 @@ impl App {
                     }
                     if !first && ts - sess_last_ts > SESSION_GAP_SECS && sess_lines + sess_files > 0
                     {
-                        total += (session_value(sess_lines, sess_files) * 10.0) as u64;
+                        total +=
+                            (session_value(sess_lines as f64, sess_files as f64) * 10.0) as u64;
                         sess_lines = 0;
                         sess_files = 0;
                     }
@@ -944,7 +986,7 @@ impl App {
                     sess_last_ts = ts;
                 }
                 if sess_lines + sess_files > 0 {
-                    total += (session_value(sess_lines, sess_files) * 10.0) as u64;
+                    total += (session_value(sess_lines as f64, sess_files as f64) * 10.0) as u64;
                 }
 
                 TrendPoint {
@@ -957,40 +999,34 @@ impl App {
     }
 
     fn detail_navigate(&mut self, delta: i32) {
-        let gid = match self.detail_group_id {
-            Some(g) => g,
-            None => return,
-        };
+        if self.view.detail_group_id.is_none() {
+            return;
+        }
         let count = self.sorted_author_count();
         if count == 0 {
             return;
         }
-        let new_gid = match self.sorted_authors().position(|a| a.group_id == gid) {
-            Some(pos) => {
-                let new_pos = if delta < 0 {
-                    pos.saturating_sub(1)
-                } else {
-                    (pos + 1).min(count - 1)
-                };
-                self.sorted_author_at(new_pos).unwrap().group_id
-            }
-            None => {
-                let fallback = if delta < 0 { count - 1 } else { 0 };
-                self.sorted_author_at(fallback).unwrap().group_id
-            }
+        let pos = self.view.detail_position.unwrap_or(0).min(count - 1);
+        let new_pos = if delta < 0 {
+            pos.saturating_sub(1)
+        } else {
+            (pos + 1).min(count - 1)
         };
-        if Some(new_gid) != self.detail_group_id {
-            self.detail_group_id = Some(new_gid);
-            self.detail_scroll = 0;
+        if new_pos != pos {
+            let new_gid = self.sorted_author_at(new_pos).unwrap().group_id;
+            self.view.detail_group_id = Some(new_gid);
+            self.view.detail_position = Some(new_pos);
+            self.view.detail_scroll = 0;
         }
     }
 
     fn start_questionnaire(&mut self) {
-        let candidates = crate::questionnaire::find_candidates(&self.groups, &self.identity_map);
+        let candidates =
+            crate::questionnaire::find_candidates(&self.data.groups, &self.data.identity_map);
         if candidates.is_empty() {
             return;
         }
-        self.questionnaire = Some(QuestionnaireState {
+        self.view.questionnaire = Some(QuestionnaireState {
             candidates: candidates
                 .into_iter()
                 .map(|(a, b)| QuestionnaireCandidate {
@@ -1005,40 +1041,44 @@ impl App {
     }
 
     fn finish_questionnaire(&mut self) {
-        let changed = self.questionnaire.as_ref().is_some_and(|q| q.changed);
-        self.questionnaire = None;
+        let changed = self.view.questionnaire.as_ref().is_some_and(|q| q.changed);
+        self.view.questionnaire = None;
 
         if changed {
-            let _ = self.identity_map.save(&self.identity_map_path);
-            let (new_groups, assignments) =
-                crate::identity::merge(&self.commits, &self.identity_map, &self.mailmap_entries);
-            for (commit, &gid) in self.commits.iter_mut().zip(assignments.iter()) {
+            let _ = self.data.identity_map.save(&self.data.identity_map_path);
+            let (new_groups, assignments) = crate::identity::merge(
+                &self.data.commits,
+                &self.data.identity_map,
+                &self.data.mailmap_entries,
+            );
+            for (commit, &gid) in self.data.commits.iter_mut().zip(assignments.iter()) {
                 commit.group_id = gid;
             }
-            self.total_authors = new_groups.len();
-            self.groups = new_groups;
-            self.detail_group_id = None;
-            self.selected = 0;
-            self.ownership_per_group.clear();
-            self.ownership_total = 0;
-            self.has_ownership = false;
+            self.data.total_authors = new_groups.len();
+            self.data.groups = new_groups;
+            self.view.detail_group_id = None;
+            self.view.detail_position = None;
+            self.view.selected = 0;
+            self.data.ownership_per_group.clear();
+            self.data.ownership_total = 0;
+            self.data.ownership = OwnershipPresence::Stale;
             self.recompute();
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
-        if self.show_theme_picker {
+        if self.view.show_theme_picker {
             match key.code {
-                KeyCode::Char('n') | KeyCode::Char('N') => self.theme = Theme::Normal,
-                KeyCode::Char('r') | KeyCode::Char('R') => self.theme = Theme::Readable,
+                KeyCode::Char('n') | KeyCode::Char('N') => self.view.theme = Theme::Normal,
+                KeyCode::Char('r') | KeyCode::Char('R') => self.view.theme = Theme::Readable,
                 KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                    self.theme = match self.theme {
+                    self.view.theme = match self.view.theme {
                         Theme::Normal => Theme::Readable,
                         Theme::Readable => Theme::Normal,
                     };
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    self.show_theme_picker = false;
+                    self.view.show_theme_picker = false;
                     self.start_questionnaire();
                 }
                 KeyCode::Esc | KeyCode::Char('q') => return true,
@@ -1047,19 +1087,19 @@ impl App {
             return false;
         }
 
-        if self.questionnaire.is_some() {
+        if self.view.questionnaire.is_some() {
             return self.handle_questionnaire_key(key);
         }
 
-        if self.view_mode == ViewMode::Detail {
+        if self.view.view_mode == ViewMode::Detail {
             return self.handle_detail_key(key);
         }
 
-        if self.view_mode == ViewMode::FileDetail {
+        if self.view.view_mode == ViewMode::FileDetail {
             return self.handle_file_detail_key(key);
         }
 
-        if self.view_mode == ViewMode::Files {
+        if self.view.view_mode == ViewMode::Files {
             return self.handle_files_key(key);
         }
 
@@ -1073,36 +1113,39 @@ impl App {
             KeyCode::Char('i') => self.set_sort(SortMode::Impact),
             KeyCode::Char('N') => self.set_sort(SortMode::Noise),
             KeyCode::Char('o') => self.set_sort(SortMode::Ownership),
-            KeyCode::Char('T') => self.show_theme_picker = true,
+            KeyCode::Char('T') => self.view.show_theme_picker = true,
             KeyCode::Char('g') => {
-                self.view_mode = match self.view_mode {
+                self.view.view_mode = match self.view.view_mode {
                     ViewMode::Table => ViewMode::Graph,
                     ViewMode::Graph => ViewMode::Table,
                     ViewMode::Detail | ViewMode::Files | ViewMode::FileDetail => ViewMode::Table,
                 };
             }
-            KeyCode::Char('V') if self.has_files_view => {
-                self.view_mode = ViewMode::Files;
-                self.file_selected = 0;
+            KeyCode::Char('V') if self.data.has_files_view => {
+                self.view.view_mode = ViewMode::Files;
+                self.view.file_selected = 0;
             }
-            KeyCode::Char('t') => self.set_time_mode(self.time_mode.next()),
+            KeyCode::Char('t') => self.set_time_mode(self.view.time_mode.next()),
             KeyCode::Left | KeyCode::Char('[') => self.time_navigate(-1),
             KeyCode::Right | KeyCode::Char(']') => self.time_navigate(1),
             KeyCode::Up | KeyCode::Char('k') => {
-                self.selected = self.selected.saturating_sub(1);
+                self.view.selected = self.view.selected.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j') if self.selected + 1 < self.authors.len() => {
-                self.selected += 1;
+            KeyCode::Down | KeyCode::Char('j')
+                if self.view.selected + 1 < self.cache.authors.len() =>
+            {
+                self.view.selected += 1;
             }
-            KeyCode::Home => self.selected = 0,
+            KeyCode::Home => self.view.selected = 0,
             KeyCode::End | KeyCode::Char('G') => {
-                self.selected = self.authors.len().saturating_sub(1);
+                self.view.selected = self.cache.authors.len().saturating_sub(1);
             }
             KeyCode::Enter => {
-                if let Some(author) = self.sorted_author_at(self.selected) {
-                    self.detail_group_id = Some(author.group_id);
-                    self.view_mode = ViewMode::Detail;
-                    self.detail_scroll = 0;
+                if let Some(author) = self.sorted_author_at(self.view.selected) {
+                    self.view.detail_group_id = Some(author.group_id);
+                    self.view.detail_position = Some(self.view.selected);
+                    self.view.view_mode = ViewMode::Detail;
+                    self.view.detail_scroll = 0;
                 }
             }
             _ => {}
@@ -1111,38 +1154,41 @@ impl App {
     }
 
     fn handle_questionnaire_key(&mut self, key: KeyEvent) -> bool {
-        let q = self.questionnaire.as_ref().unwrap();
+        let q = self.view.questionnaire.as_ref().unwrap();
         let cand = &q.candidates[q.current];
         let ga = cand.group_a;
         let gb = cand.group_b;
 
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.identity_map
-                    .add_merge(&self.groups[ga].aliases, &self.groups[gb].aliases);
-                let q = self.questionnaire.as_mut().unwrap();
+                self.data
+                    .identity_map
+                    .add_merge(&self.data.groups[ga].aliases, &self.data.groups[gb].aliases);
+                let q = self.view.questionnaire.as_mut().unwrap();
                 q.changed = true;
                 q.last_action = Some("Merged");
                 q.current += 1;
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.identity_map
-                    .add_reject(&self.groups[ga].aliases, &self.groups[gb].aliases);
-                let q = self.questionnaire.as_mut().unwrap();
+                self.data
+                    .identity_map
+                    .add_reject(&self.data.groups[ga].aliases, &self.data.groups[gb].aliases);
+                let q = self.view.questionnaire.as_mut().unwrap();
                 q.changed = true;
                 q.last_action = Some("Rejected");
                 q.current += 1;
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
-                self.identity_map
-                    .add_unsure(&self.groups[ga].aliases, &self.groups[gb].aliases);
-                let q = self.questionnaire.as_mut().unwrap();
+                self.data
+                    .identity_map
+                    .add_unsure(&self.data.groups[ga].aliases, &self.data.groups[gb].aliases);
+                let q = self.view.questionnaire.as_mut().unwrap();
                 q.changed = true;
                 q.last_action = Some("Unsure");
                 q.current += 1;
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
-                let q = self.questionnaire.as_mut().unwrap();
+                let q = self.view.questionnaire.as_mut().unwrap();
                 q.last_action = Some("Skipped");
                 q.current += 1;
             }
@@ -1154,6 +1200,7 @@ impl App {
         }
 
         if self
+            .view
             .questionnaire
             .as_ref()
             .is_some_and(|q| q.current >= q.candidates.len())
@@ -1167,51 +1214,49 @@ impl App {
     fn handle_detail_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc | KeyCode::Backspace => {
-                if let Some(gid) = self.detail_group_id {
-                    let pos = self.sorted_authors().position(|a| a.group_id == gid);
-                    if let Some(pos) = pos {
-                        self.selected = pos;
-                    }
+                if let Some(pos) = self.view.detail_position {
+                    self.view.selected = pos;
                 }
-                self.detail_group_id = None;
-                self.view_mode = ViewMode::Table;
+                self.view.detail_group_id = None;
+                self.view.detail_position = None;
+                self.view.view_mode = ViewMode::Table;
             }
             KeyCode::Char('q') => return true,
-            KeyCode::Char('t') => self.set_time_mode(self.time_mode.next()),
-            KeyCode::Char('T') => self.show_theme_picker = true,
+            KeyCode::Char('t') => self.set_time_mode(self.view.time_mode.next()),
+            KeyCode::Char('T') => self.view.show_theme_picker = true,
             KeyCode::Left | KeyCode::Char('[') => self.time_navigate(-1),
             KeyCode::Right | KeyCode::Char(']') => self.time_navigate(1),
             KeyCode::Up | KeyCode::Char('k') => self.detail_navigate(-1),
             KeyCode::Down | KeyCode::Char('j') => self.detail_navigate(1),
             KeyCode::PageUp => {
-                self.detail_scroll = self.detail_scroll.saturating_sub(5);
+                self.view.detail_scroll = self.view.detail_scroll.saturating_sub(5);
             }
             KeyCode::PageDown => {
-                self.detail_scroll = (self.detail_scroll + 5).min(DETAIL_SCROLL_MAX);
+                self.view.detail_scroll = (self.view.detail_scroll + 5).min(DETAIL_SCROLL_MAX);
             }
-            KeyCode::Home => self.detail_scroll = 0,
+            KeyCode::Home => self.view.detail_scroll = 0,
             _ => {}
         }
         false
     }
 
     fn handle_files_key(&mut self, key: KeyEvent) -> bool {
-        let count = self.file_rows.len();
+        let count = self.data.file_rows.len();
         match key.code {
             KeyCode::Esc | KeyCode::Char('V') => {
-                self.view_mode = ViewMode::Table;
+                self.view.view_mode = ViewMode::Table;
             }
             KeyCode::Char('q') => return true,
             KeyCode::Enter => self.open_file_detail(),
             KeyCode::Up | KeyCode::Char('k') => {
-                self.file_selected = self.file_selected.saturating_sub(1);
+                self.view.file_selected = self.view.file_selected.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j') if self.file_selected + 1 < count => {
-                self.file_selected += 1;
+            KeyCode::Down | KeyCode::Char('j') if self.view.file_selected + 1 < count => {
+                self.view.file_selected += 1;
             }
-            KeyCode::Home => self.file_selected = 0,
+            KeyCode::Home => self.view.file_selected = 0,
             KeyCode::End | KeyCode::Char('G') => {
-                self.file_selected = count.saturating_sub(1);
+                self.view.file_selected = count.saturating_sub(1);
             }
             KeyCode::Char('c') => self.set_file_sort(FileSortMode::Commits),
             KeyCode::Char('a') => self.set_file_sort(FileSortMode::Authors),
@@ -1225,46 +1270,48 @@ impl App {
     fn handle_file_detail_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc | KeyCode::Backspace => {
-                self.file_detail = None;
-                self.view_mode = ViewMode::Files;
+                self.cache.file_detail = None;
+                self.view.view_mode = ViewMode::Files;
             }
             KeyCode::Char('q') => return true,
             KeyCode::Up | KeyCode::Char('k') => {
-                self.file_detail_scroll = self.file_detail_scroll.saturating_sub(1);
+                self.view.file_detail_scroll = self.view.file_detail_scroll.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 let max = self
+                    .cache
                     .file_detail
                     .as_ref()
                     .map(|d| d.coupled_files.len().saturating_sub(1))
                     .unwrap_or(0);
-                if self.file_detail_scroll < max {
-                    self.file_detail_scroll += 1;
+                if self.view.file_detail_scroll < max {
+                    self.view.file_detail_scroll += 1;
                 }
             }
             KeyCode::PageUp => {
-                self.file_detail_scroll = self.file_detail_scroll.saturating_sub(10);
+                self.view.file_detail_scroll = self.view.file_detail_scroll.saturating_sub(10);
             }
             KeyCode::PageDown => {
                 let max = self
+                    .cache
                     .file_detail
                     .as_ref()
                     .map(|d| d.coupled_files.len().saturating_sub(1))
                     .unwrap_or(0);
-                self.file_detail_scroll = (self.file_detail_scroll + 10).min(max);
+                self.view.file_detail_scroll = (self.view.file_detail_scroll + 10).min(max);
             }
-            KeyCode::Home => self.file_detail_scroll = 0,
+            KeyCode::Home => self.view.file_detail_scroll = 0,
             _ => {}
         }
         false
     }
 
     pub fn graph_data(&self) -> Ref<'_, GraphData> {
-        if self.graph_cache.borrow().is_none() {
+        if self.cache.graph_cache.borrow().is_none() {
             let data = self.compute_graph_data();
-            *self.graph_cache.borrow_mut() = Some(data);
+            *self.cache.graph_cache.borrow_mut() = Some(data);
         }
-        Ref::map(self.graph_cache.borrow(), |o| o.as_ref().unwrap())
+        Ref::map(self.cache.graph_cache.borrow(), |o| o.as_ref().unwrap())
     }
 
     fn compute_graph_data(&self) -> GraphData {
@@ -1283,12 +1330,12 @@ impl App {
 
         let (raw_start, raw_end) = self.time_bounds();
         let start = if raw_start == 0 {
-            self.earliest
+            self.data.earliest
         } else {
             raw_start
         };
         let end = if raw_end == i64::MAX {
-            self.latest + SECONDS_PER_DAY
+            self.data.latest + SECONDS_PER_DAY
         } else {
             raw_end
         };
@@ -1297,24 +1344,22 @@ impl App {
         let num_periods = labels.len();
 
         let total_authors = self.sorted_author_count();
-        let top_n = GRAPH_TOP_N.min(total_authors);
-        let top_ids: Vec<usize> = self
-            .sorted_authors()
-            .take(top_n)
-            .map(|a| a.group_id)
+        let top_ids: Vec<usize> = self.sorted_authors().map(|a| a.group_id).collect();
+
+        let slot_map: std::collections::HashMap<usize, usize> = top_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &gid)| (gid, i))
             .collect();
+        let mut per_author: Vec<Vec<(i64, usize, usize)>> = vec![Vec::new(); total_authors];
 
-        let num_slots = top_n + 1;
-        let mut per_author: Vec<Vec<(i64, usize, usize)>> = vec![Vec::new(); num_slots];
-
-        for entry in &self.commits {
+        for entry in &self.data.commits {
             if entry.timestamp < start || entry.timestamp >= end {
                 continue;
             }
-            let author_idx = top_ids
-                .iter()
-                .position(|&id| id == entry.group_id)
-                .unwrap_or(top_n);
+            let Some(&author_idx) = slot_map.get(&entry.group_id) else {
+                continue;
+            };
             per_author[author_idx].push((
                 entry.timestamp,
                 entry.lines_added + entry.lines_removed,
@@ -1322,7 +1367,7 @@ impl App {
             ));
         }
 
-        let mut buckets: Vec<Vec<u64>> = vec![vec![0; num_periods]; num_slots];
+        let mut buckets: Vec<Vec<u64>> = vec![vec![0; num_periods]; total_authors];
 
         for (ai, commits) in per_author.iter_mut().enumerate() {
             if commits.is_empty() {
@@ -1336,7 +1381,7 @@ impl App {
 
             for &(ts, lines, files) in commits.iter() {
                 if ts - sess_last_ts > SESSION_GAP_SECS && sess_lines + sess_files > 0 {
-                    let val = session_value(sess_lines, sess_files);
+                    let val = session_value(sess_lines as f64, sess_files as f64);
                     let bucket = boundaries
                         .partition_point(|&b| b <= sess_last_ts)
                         .saturating_sub(1)
@@ -1350,7 +1395,7 @@ impl App {
                 sess_last_ts = ts;
             }
             if sess_lines + sess_files > 0 {
-                let val = session_value(sess_lines, sess_files);
+                let val = session_value(sess_lines as f64, sess_files as f64);
                 let bucket = boundaries
                     .partition_point(|&b| b <= sess_last_ts)
                     .saturating_sub(1)
@@ -1359,9 +1404,8 @@ impl App {
             }
         }
 
-        let mut rows: Vec<GraphRow> = self
+        let rows: Vec<GraphRow> = self
             .sorted_authors()
-            .take(top_n)
             .enumerate()
             .map(|(i, a)| GraphRow {
                 name: a.display_name.clone(),
@@ -1369,14 +1413,6 @@ impl App {
                 color: PALETTE[i % PALETTE.len()],
             })
             .collect();
-
-        if total_authors > top_n {
-            rows.push(GraphRow {
-                name: "others".to_string(),
-                data: std::mem::take(&mut buckets[top_n]),
-                color: Color::Rgb(108, 118, 148),
-            });
-        }
 
         GraphData { labels, rows }
     }
@@ -1599,12 +1635,12 @@ fn compute_impact(sorted_commits: &[&Commit]) -> f64 {
     let effective_lines = substantive_lines as f64 + ws_contribution;
 
     let effective_files = total_files as f64 + merge_files as f64 * 0.1;
-    let substance = session_value(effective_lines as usize, effective_files as usize);
+    let substance = session_value(effective_lines, effective_files);
     substance * (1.0 + 0.15 * (sessions as f64).ln())
 }
 
-fn session_value(lines: usize, files: usize) -> f64 {
-    (1.0 + (1.0 + lines as f64).ln()) * (1.0 + 0.5 * (1.0 + files as f64).ln())
+fn session_value(lines: f64, files: f64) -> f64 {
+    (1.0 + (1.0 + lines).ln()) * (1.0 + 0.5 * (1.0 + files).ln())
 }
 
 #[cfg(test)]
@@ -1619,55 +1655,21 @@ mod tests {
         );
     }
 
-    fn make_commit(
-        lines_added: usize,
-        lines_removed: usize,
-        files_changed: usize,
-        timestamp: i64,
-        is_merge: bool,
-    ) -> Commit {
-        Commit {
-            author_name: "Test".into(),
-            author_email: "test@example.com".into(),
-            group_id: 0,
-            lines_added,
-            lines_removed,
-            files_changed,
-            timestamp,
-            whitespace_added: 0,
-            whitespace_removed: 0,
-            files_added: 0,
-            files_deleted: 0,
-            files_renamed: 0,
-            is_merge,
-        }
-    }
-
-    fn make_classify_input(
-        lines_added: usize,
-        lines_removed: usize,
-        files_changed: usize,
-        whitespace_added: usize,
-        whitespace_removed: usize,
-        files_added: usize,
-        files_deleted: usize,
-        files_renamed: usize,
-        is_merge: bool,
-    ) -> Commit {
+    fn default_commit() -> Commit {
         Commit {
             author_name: "Test".into(),
             author_email: "test@example.com".into(),
             group_id: 0,
             timestamp: 0,
-            lines_added,
-            lines_removed,
-            files_changed,
-            whitespace_added,
-            whitespace_removed,
-            files_added,
-            files_deleted,
-            files_renamed,
-            is_merge,
+            lines_added: 0,
+            lines_removed: 0,
+            files_changed: 0,
+            whitespace_added: 0,
+            whitespace_removed: 0,
+            files_added: 0,
+            files_deleted: 0,
+            files_renamed: 0,
+            is_merge: false,
         }
     }
 
@@ -1717,79 +1719,130 @@ mod tests {
 
     #[test]
     fn session_value_zeros() {
-        assert_approx(session_value(0, 0), 1.0);
+        assert_approx(session_value(0.0, 0.0), 1.0);
     }
 
     #[test]
     fn session_value_lines_only() {
-        assert_approx(session_value(1, 0), 1.0 + 2.0_f64.ln());
+        assert_approx(session_value(1.0, 0.0), 1.0 + 2.0_f64.ln());
     }
 
     #[test]
     fn session_value_both() {
         let expected = (1.0 + 11.0_f64.ln()) * (1.0 + 0.5 * 3.0_f64.ln());
-        assert_approx(session_value(10, 2), expected);
+        assert_approx(session_value(10.0, 2.0), expected);
     }
 
     // --- classify_commit ---
 
     #[test]
     fn classify_merge() {
-        let c = make_classify_input(100, 50, 10, 0, 0, 5, 2, 0, true);
+        let c = Commit {
+            lines_added: 100,
+            lines_removed: 50,
+            files_changed: 10,
+            files_added: 5,
+            files_deleted: 2,
+            is_merge: true,
+            ..default_commit()
+        };
         assert_eq!(classify_commit(&c), ChangeKind::Merge);
     }
 
     #[test]
     fn classify_trivial_whitespace_only() {
-        let c = make_classify_input(5, 5, 3, 5, 5, 0, 0, 0, false);
+        let c = Commit {
+            lines_added: 5,
+            lines_removed: 5,
+            files_changed: 3,
+            whitespace_added: 5,
+            whitespace_removed: 5,
+            ..default_commit()
+        };
         assert_eq!(classify_commit(&c), ChangeKind::Trivial);
     }
 
     #[test]
     fn classify_trivial_small() {
-        let c = make_classify_input(3, 2, 1, 0, 0, 0, 0, 0, false);
+        let c = Commit {
+            lines_added: 3,
+            lines_removed: 2,
+            files_changed: 1,
+            ..default_commit()
+        };
         assert_eq!(classify_commit(&c), ChangeKind::Trivial);
     }
 
     #[test]
     fn classify_trivial_empty() {
-        let c = make_classify_input(0, 0, 0, 0, 0, 0, 0, 0, false);
+        let c = default_commit();
         assert_eq!(classify_commit(&c), ChangeKind::Trivial);
     }
 
     #[test]
     fn classify_rename() {
-        let c = make_classify_input(15, 15, 4, 0, 0, 0, 0, 2, false);
+        let c = Commit {
+            lines_added: 15,
+            lines_removed: 15,
+            files_changed: 4,
+            files_renamed: 2,
+            ..default_commit()
+        };
         assert_eq!(classify_commit(&c), ChangeKind::Rename);
     }
 
     #[test]
     fn classify_rename_too_many_lines() {
-        let c = make_classify_input(21, 0, 2, 0, 0, 0, 0, 1, false);
+        let c = Commit {
+            lines_added: 21,
+            files_changed: 2,
+            files_renamed: 1,
+            ..default_commit()
+        };
         assert_ne!(classify_commit(&c), ChangeKind::Rename);
     }
 
     #[test]
     fn classify_feature_new_files() {
-        let c = make_classify_input(20, 0, 3, 0, 0, 1, 0, 0, false);
+        let c = Commit {
+            lines_added: 20,
+            files_changed: 3,
+            files_added: 1,
+            ..default_commit()
+        };
         assert_eq!(classify_commit(&c), ChangeKind::Feature);
     }
 
     #[test]
     fn classify_refactor_deleted_files() {
-        let c = make_classify_input(0, 20, 2, 0, 0, 0, 1, 0, false);
+        let c = Commit {
+            lines_removed: 20,
+            files_changed: 2,
+            files_deleted: 1,
+            ..default_commit()
+        };
         assert_eq!(classify_commit(&c), ChangeKind::Refactor);
     }
 
     #[test]
     fn classify_feature_high_add_ratio() {
-        let c = make_classify_input(9, 3, 3, 0, 0, 0, 0, 0, false);
+        let c = Commit {
+            lines_added: 9,
+            lines_removed: 3,
+            files_changed: 3,
+            ..default_commit()
+        };
         assert_eq!(classify_commit(&c), ChangeKind::Feature);
     }
 
     #[test]
     fn classify_refactor_low_add_ratio() {
-        let c = make_classify_input(3, 3, 3, 0, 0, 0, 0, 0, false);
+        let c = Commit {
+            lines_added: 3,
+            lines_removed: 3,
+            files_changed: 3,
+            ..default_commit()
+        };
         assert_eq!(classify_commit(&c), ChangeKind::Refactor);
     }
 
@@ -1803,50 +1856,91 @@ mod tests {
 
     #[test]
     fn impact_single_commit() {
-        let c = make_commit(10, 0, 3, 1000, false);
-        let expected = session_value(10, 3);
+        let c = Commit {
+            lines_added: 10,
+            files_changed: 3,
+            timestamp: 1000,
+            ..default_commit()
+        };
+        let expected = session_value(10.0, 3.0);
         assert_approx(compute_impact(&[&c]), expected);
     }
 
     #[test]
     fn impact_same_session() {
-        let c1 = make_commit(5, 0, 1, 0, false);
-        let c2 = make_commit(5, 0, 1, 1000, false);
-        let one_session = session_value(10, 2) * 1.0;
+        let c1 = Commit {
+            lines_added: 5,
+            files_changed: 1,
+            ..default_commit()
+        };
+        let c2 = Commit {
+            lines_added: 5,
+            files_changed: 1,
+            timestamp: 1000,
+            ..default_commit()
+        };
+        let one_session = session_value(10.0, 2.0) * 1.0;
         assert_approx(compute_impact(&[&c1, &c2]), one_session);
     }
 
     #[test]
     fn impact_boundary_not_new_session() {
-        let c1 = make_commit(5, 0, 1, 0, false);
-        let c2 = make_commit(5, 0, 1, SESSION_GAP_SECS, false);
-        let one_session = session_value(10, 2);
+        let c1 = Commit {
+            lines_added: 5,
+            files_changed: 1,
+            ..default_commit()
+        };
+        let c2 = Commit {
+            lines_added: 5,
+            files_changed: 1,
+            timestamp: SESSION_GAP_SECS,
+            ..default_commit()
+        };
+        let one_session = session_value(10.0, 2.0);
         assert_approx(compute_impact(&[&c1, &c2]), one_session);
     }
 
     #[test]
     fn impact_boundary_new_session() {
-        let c1 = make_commit(5, 0, 1, 0, false);
-        let c2 = make_commit(5, 0, 1, SESSION_GAP_SECS + 1, false);
-        let two_sessions = session_value(10, 2) * (1.0 + 0.15 * 2.0_f64.ln());
+        let c1 = Commit {
+            lines_added: 5,
+            files_changed: 1,
+            ..default_commit()
+        };
+        let c2 = Commit {
+            lines_added: 5,
+            files_changed: 1,
+            timestamp: SESSION_GAP_SECS + 1,
+            ..default_commit()
+        };
+        let two_sessions = session_value(10.0, 2.0) * (1.0 + 0.15 * 2.0_f64.ln());
         assert_approx(compute_impact(&[&c1, &c2]), two_sessions);
     }
 
     #[test]
     fn impact_whitespace_discount() {
-        let mut c = make_commit(10, 10, 2, 0, false);
-        c.whitespace_added = 10;
-        c.whitespace_removed = 10;
-        let effective_lines = (0.0 + 20.0 * 0.1) as usize; // 2
-        let expected = session_value(effective_lines, 2);
+        let c = Commit {
+            lines_added: 10,
+            lines_removed: 10,
+            files_changed: 2,
+            whitespace_added: 10,
+            whitespace_removed: 10,
+            ..default_commit()
+        };
+        let effective_lines = 20.0 * 0.1; // 2.0
+        let expected = session_value(effective_lines, 2.0);
         assert_approx(compute_impact(&[&c]), expected);
     }
 
     #[test]
     fn impact_merge_file_discount() {
-        let c = make_commit(0, 0, 10, 0, true);
-        let effective_files = (10.0 * 0.1) as usize; // 1
-        let expected = session_value(0, effective_files);
+        let c = Commit {
+            files_changed: 10,
+            is_merge: true,
+            ..default_commit()
+        };
+        let effective_files = 10.0 * 0.1; // 1.0
+        let expected = session_value(0.0, effective_files);
         assert_approx(compute_impact(&[&c]), expected);
     }
 }

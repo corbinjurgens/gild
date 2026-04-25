@@ -30,7 +30,8 @@ impl fmt::Display for Sep {
                 buf[pos] = b',';
             }
         }
-        f.write_str(std::str::from_utf8(&buf[pos..]).unwrap())
+        // SAFETY: buf only contains ASCII digits (b'0'..=b'9') and b','
+        f.write_str(unsafe { std::str::from_utf8_unchecked(&buf[pos..]) })
     }
 }
 

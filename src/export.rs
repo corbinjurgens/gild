@@ -36,11 +36,11 @@ fn export_json(app: &App) -> Result<String> {
         .collect();
 
     let doc = serde_json::json!({
-        "repository": app.repo_info.name,
-        "branch": app.repo_info.branch,
+        "repository": app.data.repo_info.name,
+        "branch": app.data.repo_info.branch,
         "time_range": app.time_label(),
-        "total_commits": app.filtered_commits,
-        "total_authors": app.authors.len(),
+        "total_commits": app.cache.filtered_commits,
+        "total_authors": app.cache.authors.len(),
         "authors": authors,
     });
 
@@ -207,10 +207,10 @@ tr:hover {{ background:#44475a; }}
 </table>
 </body>
 </html>"#,
-        repo = html_escape(&app.repo_info.name),
-        branch = html_escape(&app.repo_info.branch),
-        commits = Sep(app.filtered_commits),
-        authors = app.authors.len(),
+        repo = html_escape(&app.data.repo_info.name),
+        branch = html_escape(&app.data.repo_info.branch),
+        commits = Sep(app.cache.filtered_commits),
+        authors = app.cache.authors.len(),
         time = html_escape(&app.time_label()),
     )
 }

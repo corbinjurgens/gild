@@ -134,6 +134,7 @@ fn env_token() -> Option<String> {
         .find_map(|var| std::env::var(var).ok())
 }
 
+#[allow(clippy::result_large_err)]
 fn env_credentials() -> Option<impl FnMut(helper::Action) -> protocol::Result> {
     let token = env_token()?;
     Some(move |action| match action {

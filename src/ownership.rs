@@ -29,7 +29,7 @@ thread_local! {
 
 pub fn compute(
     repo: &gix::Repository,
-    db: &Database,
+    db: &mut Database,
     groups: &[IdentityGroup],
     on_progress: impl Fn(usize, usize) + Send,
 ) -> Result<OwnershipData> {
@@ -58,10 +58,17 @@ pub fn compute(
     // its final_commit_id via `repo.find_commit(oid)` — doing that per hunk
     // across ~30k files dominates CPU once parallelism is saturated. One
     // SQLite read gives us an O(1) process-wide lookup instead.
-    let oid_to_email: HashMap<String, String> = {
+    let oid_to_email: HashMap<gix::ObjectId, String> = {
         let mut stmt = db.prepare("SELECT hash, LOWER(author_email) FROM commits")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        rows.filter_map(|r| r.ok()).collect()
+        let mut map = HashMap::new();
+        for row in rows {
+            let (hex, email) = row?;
+            if let Ok(oid) = gix::ObjectId::from_hex(hex.as_bytes()) {
+                map.insert(oid, email);
+            }
+        }
+        map
     };
 
     // Is the commits table a superset of HEAD's history? The fast path below
@@ -103,7 +110,7 @@ pub fn compute(
              HAVING COUNT(DISTINCT LOWER(c.author_email)) = 1",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        rows.filter_map(|r| r.ok()).collect()
+        rows.collect::<std::result::Result<_, _>>()?
     } else {
         HashMap::new()
     };
@@ -115,7 +122,7 @@ pub fn compute(
         let mut stmt =
             db.prepare("SELECT DISTINCT file_path FROM blame_file WHERE head_hash = ?1")?;
         let rows = stmt.query_map(params![&cache_key], |r| r.get::<_, String>(0))?;
-        rows.filter_map(|r| r.ok()).collect()
+        rows.collect::<std::result::Result<_, _>>()?
     };
 
     // Partition remaining work: solo-authored files bypass blame, the rest
@@ -260,12 +267,15 @@ pub fn compute(
         }
     }
     tx.execute(
-        "INSERT INTO ownership_meta (head_hash, total_lines) VALUES (?1, ?2)",
-        params![&cache_key, total_lines as i64],
-    )?;
-    tx.execute(
         "DELETE FROM blame_file WHERE head_hash = ?1",
         params![&cache_key],
+    )?;
+    // Sentinel last: ownership_meta presence is the cache-hit signal (line 45),
+    // so writing it after all other mutations makes the commit-or-nothing
+    // guarantee visually obvious.
+    tx.execute(
+        "INSERT INTO ownership_meta (head_hash, total_lines) VALUES (?1, ?2)",
+        params![&cache_key, total_lines as i64],
     )?;
     tx.commit()?;
 
@@ -290,7 +300,7 @@ fn blame_file_lines(
     repo: &gix::Repository,
     file_path: &str,
     head_oid: gix::ObjectId,
-    oid_to_email: &HashMap<String, String>,
+    oid_to_email: &HashMap<gix::ObjectId, String>,
 ) -> HashMap<String, usize> {
     let outcome =
         match repo.blame_file(file_path.as_bytes().as_bstr(), head_oid, Default::default()) {
@@ -300,8 +310,7 @@ fn blame_file_lines(
 
     let mut local: HashMap<String, usize> = HashMap::new();
     for entry in &outcome.entries {
-        let oid_str = entry.commit_id.to_string();
-        if let Some(email) = oid_to_email.get(&oid_str) {
+        if let Some(email) = oid_to_email.get(&entry.commit_id) {
             *local.entry(email.clone()).or_insert(0) += entry.len.get() as usize;
         } else if let Some(email) = resolve_commit_email(repo, entry.commit_id) {
             *local.entry(email).or_insert(0) += entry.len.get() as usize;

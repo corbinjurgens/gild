@@ -52,6 +52,11 @@ pub fn merge<'a>(
         union_all(&mut parent, &mut rank, indices);
     }
 
+    let mailmap_names: HashMap<usize, String> = mailmap_names
+        .into_iter()
+        .map(|(old_root, name)| (find(&mut parent, old_root), name))
+        .collect();
+
     let mut group_members: HashMap<usize, Vec<usize>> = HashMap::new();
     for i in 0..n {
         group_members
@@ -300,6 +305,26 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].display_name, "Canonical");
         assert_eq!(assignments[0], assignments[1]);
+    }
+
+    #[test]
+    fn merge_mailmap_survives_email_union() {
+        let commits = vec![
+            make_commit("Old Name", "old@x.com"),
+            make_commit("New Name", "new@x.com"),
+            make_commit("Also New", "new@x.com"),
+        ];
+        let mailmap = vec![MailmapEntry {
+            canonical_name: Some("Canonical".into()),
+            canonical_email: "new@x.com".into(),
+            commit_name: None,
+            commit_email: Some("old@x.com".into()),
+        }];
+        let (groups, assignments) = merge(&commits, &IdentityMap::default(), &mailmap);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].display_name, "Canonical");
+        assert_eq!(assignments[0], assignments[1]);
+        assert_eq!(assignments[1], assignments[2]);
     }
 
     #[test]

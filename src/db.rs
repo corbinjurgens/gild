@@ -13,11 +13,10 @@ impl Database {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(Duration::from_secs(5))?;
-        migrate(&conn)?;
+        migrate(&mut conn)?;
         Ok(Database { conn })
     }
 
@@ -33,14 +32,23 @@ impl Database {
         self.conn.query_row(sql, params, f)
     }
 
-    pub(crate) fn transaction(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
-        self.conn.unchecked_transaction()
+    pub(crate) fn transaction(&mut self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        self.conn.transaction()
     }
 }
 
 // `commit_files.kind`: 0 = touched, 1 = added, 2 = deleted.
 // Separate rows for added/deleted instead of a flag on "touched" so queries
 // for added-file events can hit the index directly.
+pub fn file_addon_cache_key(db: &Database, head_hash: &str) -> Result<String> {
+    let (count, max_ts): (i64, i64) = db.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(timestamp), 0) FROM commits",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(format!("n={count},ts={max_ts},head={head_hash}"))
+}
+
 pub const FILE_KIND_TOUCHED: i64 = 0;
 pub const FILE_KIND_ADDED: i64 = 1;
 pub const FILE_KIND_DELETED: i64 = 2;
@@ -128,7 +136,7 @@ const MIGRATIONS: &[&str] = &[
     "#,
 ];
 
-fn migrate(conn: &Connection) -> Result<()> {
+fn migrate(conn: &mut Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)",
         [],
@@ -141,7 +149,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let target = (i + 1) as u32;
         if target > current {
-            let tx = conn.unchecked_transaction()?;
+            let tx = conn.transaction()?;
             tx.execute_batch(sql)?;
             tx.execute("INSERT INTO schema_version (version) VALUES (?1)", [target])?;
             tx.commit()?;

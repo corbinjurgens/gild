@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "gild"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -598,6 +598,7 @@ dependencies = [
  "serde_json",
  "strsim",
  "toml",
+ "unicode-width 0.2.0",
  "xxhash-rust",
 ]
 

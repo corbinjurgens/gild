@@ -1,4 +1,4 @@
-use crate::util::{load_or_default, write_atomic};
+use crate::storage::{load_or_default, write_atomic};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;

@@ -88,7 +88,7 @@ pub fn load_commits(
         if let Some(cached) = cache.get(&hash) {
             ordered.push(Some(cached));
             cached_count += 1;
-            if cached_count.is_multiple_of(200) {
+            if cached_count % 200 == 0 {
                 on_progress(cached_count, 0);
             }
         } else {
@@ -145,7 +145,9 @@ pub fn load_commits(
         .into_iter()
         .enumerate()
         .map(|(i, opt)| {
-            opt.ok_or_else(|| anyhow::anyhow!("commit slot {i} was never filled — possible gap in walk"))
+            opt.ok_or_else(|| {
+                anyhow::anyhow!("commit slot {i} was never filled — possible gap in walk")
+            })
         })
         .collect::<Result<Vec<_>>>()?;
 

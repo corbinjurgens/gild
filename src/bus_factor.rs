@@ -10,11 +10,10 @@ pub struct BusFactorRow {
 
 pub fn compute(
     repo: &gix::Repository,
-    db: &Database,
+    db: &mut Database,
+    head_hash: &str,
     on_progress: impl Fn(usize, usize),
 ) -> Result<Vec<BusFactorRow>> {
-    let head_hash = repo.head()?.into_peeled_id()?.to_string();
-
     let cached_count: i64 = db
         .query_row(
             "SELECT COUNT(*) FROM file_bus_factor WHERE head_hash = ?1",
@@ -23,49 +22,48 @@ pub fn compute(
         )
         .unwrap_or(0);
     if cached_count > 0 {
-        return load_from_db(db, &head_hash);
+        return load_from_db(db, head_hash);
     }
 
     let head_files = crate::ownership::walk_tree_sizes(repo);
     let total = head_files.len();
     on_progress(0, total);
 
-    // SQLite counts unique authors per file directly. LOWER() matches the
-    // prior `to_lowercase()` treatment; non-ASCII emails (rare) degrade to
-    // the same result as the old code for ASCII-only input.
-    let mut stmt = db.prepare(
-        "SELECT cf.file_path, COUNT(DISTINCT LOWER(c.author_email))
-         FROM commit_files cf
-         JOIN commits c ON c.hash = cf.commit_hash
-         WHERE cf.kind = ?1
-         GROUP BY cf.file_path",
-    )?;
-    let rows = stmt.query_map(params![FILE_KIND_TOUCHED], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
-    })?;
+    let author_counts: Vec<(String, u32)> = {
+        let mut stmt = db.prepare(
+            "SELECT cf.file_path, COUNT(DISTINCT LOWER(c.author_email))
+             FROM commit_files cf
+             JOIN commits c ON c.hash = cf.commit_hash
+             WHERE cf.kind = ?1
+             GROUP BY cf.file_path",
+        )?;
+        let rows = stmt.query_map(params![FILE_KIND_TOUCHED], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
 
-    let tx_conn = db.transaction()?;
-    tx_conn.execute(
+    let tx = db.transaction()?;
+    tx.execute(
         "DELETE FROM file_bus_factor WHERE head_hash = ?1",
         params![&head_hash],
     )?;
     {
-        let mut insert = tx_conn.prepare(
+        let mut insert = tx.prepare(
             "INSERT INTO file_bus_factor (file, head_hash, unique_authors)
              VALUES (?1, ?2, ?3)",
         )?;
-        for row in rows {
-            let (file, unique) = row?;
-            if !head_files.contains_key(&file) {
+        for (file, unique) in &author_counts {
+            if !head_files.contains_key(file) {
                 continue;
             }
-            insert.execute(params![file, &head_hash, unique as i64])?;
+            insert.execute(params![file, &head_hash, *unique as i64])?;
         }
     }
-    tx_conn.commit()?;
+    tx.commit()?;
 
     on_progress(total, total);
-    load_from_db(db, &head_hash)
+    load_from_db(db, head_hash)
 }
 
 fn load_from_db(db: &Database, head_hash: &str) -> Result<Vec<BusFactorRow>> {

@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::params;
 use std::collections::HashMap;
 
-use crate::db::{Database, FILE_KIND_TOUCHED};
+use crate::db::{file_addon_cache_key, Database, FILE_KIND_TOUCHED};
 
 pub struct FileCouplingRow {
     pub file: String,
@@ -10,30 +10,17 @@ pub struct FileCouplingRow {
     pub top_partner: Option<(String, f64)>,
 }
 
-// Commits touching more than this many files dominate pair counts with
-// incidental co-occurrences (sweeping refactors, generated-code regens).
 const MAX_FILES_PER_COMMIT: i64 = 50;
 const MIN_CO_OCCURRENCES: u32 = 3;
 const MIN_SCORE: f64 = 0.1;
 
-fn cache_key(db: &Database, head_hash: &str) -> Result<String> {
-    let (count, max_ts): (i64, i64) = db.query_row(
-        "SELECT COUNT(*), COALESCE(MAX(timestamp), 0) FROM commits",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    // head_hash is part of the key so that `file_stats.current_lines` (set by
-    // churn using HEAD's `walk_tree_sizes`) is never shown under a different
-    // HEAD than the one that produced it.
-    Ok(format!("n={count},ts={max_ts},head={head_hash}"))
-}
-
 pub fn compute(
-    db: &Database,
+    _repo: &gix::Repository,
+    db: &mut Database,
     head_hash: &str,
     on_progress: impl Fn(usize, usize),
 ) -> Result<Vec<FileCouplingRow>> {
-    let key = cache_key(db, head_hash)?;
+    let key = file_addon_cache_key(db, head_hash)?;
 
     let cached_count: i64 = db
         .query_row(
@@ -132,7 +119,7 @@ fn accumulate(
 }
 
 fn persist(
-    db: &Database,
+    db: &mut Database,
     key: &str,
     names: &[String],
     file_counts: &HashMap<u32, u32>,
@@ -166,7 +153,12 @@ fn persist(
             if score < MIN_SCORE {
                 continue;
             }
-            stmt.execute(params![&names[id_a as usize], &names[id_b as usize], co as i64, score])?;
+            stmt.execute(params![
+                &names[id_a as usize],
+                &names[id_b as usize],
+                co as i64,
+                score
+            ])?;
         }
     }
     tx.commit()?;

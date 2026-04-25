@@ -62,7 +62,7 @@ impl Cache {
         })
     }
 
-    pub fn save(&mut self, db: &Database) -> Result<()> {
+    pub fn save(&mut self, db: &mut Database) -> Result<()> {
         if !self.dirty {
             return Ok(());
         }
@@ -75,7 +75,7 @@ impl Cache {
                     files_added, files_deleted, is_merge, files_renamed
                  ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             )?;
-            for (hash, c) in self.staged_commits.drain() {
+            for (hash, c) in self.staged_commits.iter() {
                 stmt.execute(params![
                     hash,
                     c.author_name,
@@ -98,7 +98,7 @@ impl Cache {
                 "INSERT OR IGNORE INTO commit_files (commit_hash, file_path, kind)
                  VALUES (?1, ?2, ?3)",
             )?;
-            for (hash, f) in self.staged_files.drain() {
+            for (hash, f) in self.staged_files.iter() {
                 for path in &f.files {
                     stmt.execute(params![hash, path, FILE_KIND_TOUCHED])?;
                 }
@@ -111,6 +111,8 @@ impl Cache {
             }
         }
         tx.commit()?;
+        self.staged_commits.clear();
+        self.staged_files.clear();
         self.dirty = false;
         Ok(())
     }

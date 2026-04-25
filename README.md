@@ -67,21 +67,23 @@ Deep-analysis features are opt-in via `--add-on`. They run after the normal comm
 ```sh
 gild --add-on ownership         # blame-based code ownership (Own% column)
 gild --add-on coupling          # file co-occurrence analysis (Files view)
-gild --add-on bus-factor        # unique-author risk per file (Files view)
-gild --add-on churn             # change-frequency hotspots (Files view)
+gild --add-on authors           # unique-author risk per file (Files view)
+gild --add-on hotspot           # change-frequency hotspots (Files view)
 gild --add-on types             # commit type breakdown in detail view
-gild --add-on coupling --add-on bus-factor --add-on churn   # stack multiple
+gild --add-on coupling --add-on authors --add-on hotspot   # stack multiple
 ```
 
 | Add-on | Time window aware | Displayed in |
 |--------|-------------------|--------------|
 | `ownership` | No — blame reflects current HEAD; column hidden for historical windows | Author table (`Own%` column) |
 | `coupling` | Yes | Files view |
-| `bus-factor` | Yes | Files view |
-| `churn` | Yes | Files view |
+| `authors` | Yes | Files view |
+| `hotspot` | Yes | Files view |
 | `types` | Yes | Detail view (commit type breakdown line) |
 
-The `coupling`, `bus-factor`, and `churn` add-ons contribute to the Files view (press `V` in the TUI). Columns appear only for the add-ons that ran.
+Legacy aliases `bus-factor`, `churn`, and `commit-types` are still accepted as drop-in replacements for `authors`, `hotspot`, and `types`.
+
+The `coupling`, `authors`, and `hotspot` add-ons contribute to the Files view (press `V` in the TUI). Columns appear only for the add-ons that ran.
 
 The `types` add-on enables a per-author commit classification breakdown in the detail view, categorizing commits as feature / refactor / rename / trivial / merge. Rename detection uses git's built-in rename tracking — a commit is classified as a rename when the majority of file operations are renames with modest line changes. All categories are based on knowable facts (file operations, line counts), not heuristics.
 
@@ -104,7 +106,7 @@ Fields that only reflect the current state of the repository (like `Own%`) autom
 | `t` | Cycle time window (all / year / quarter / month) |
 | `[` / `]` / `Left` / `Right` | Navigate time period |
 | `g` | Toggle table / graph view |
-| `V` | Open Files view (when coupling / bus-factor / churn add-ons active) |
+| `V` | Open Files view (when coupling / authors / hotspot add-ons active) |
 | `T` | Theme picker (Normal / Readable) |
 | `Enter` | Detail drill-down (top files, activity heatmap, new/deleted files) |
 | `j` / `k` / `Up` / `Down` | Select author |
@@ -118,8 +120,8 @@ Fields that only reflect the current state of the repository (like `Own%`) autom
 | `j` / `k` / `Up` / `Down` | Select file |
 | `G` | Jump to bottom |
 | `c` | Sort by commits |
-| `a` | Sort by unique authors (bus-factor) |
-| `h` | Sort by churn score |
+| `a` | Sort by unique authors (bus factor) |
+| `h` | Sort by hotspot score |
 | `p` | Sort by coupling score |
 | `V` / `Esc` | Return to table |
 | `q` | Quit |
@@ -143,8 +145,8 @@ Fields that only reflect the current state of the repository (like `Own%`) autom
 - **Identity deduplication** — union-find merges authors by email, `.mailmap`, and saved confirmations; an interactive questionnaire catches fuzzy matches (Levenshtein, substring, email heuristics)
 - **Code ownership** (`--add-on ownership`) — runs blame (via gitoxide/imara-diff) on every non-binary file in HEAD and attributes each surviving line to its author. This is more accurate than last-touch (who last committed the file) because it measures who wrote the code that is actually alive today. Cached forever per HEAD hash. Since ownership reflects the current HEAD state, the `Own%` column is only shown when the active time window includes the present
 - **File coupling** (`--add-on coupling`) — counts how often pairs of files appear in the same commit. Score = `co_occurrences / min(commit_count_a, commit_count_b)`. High-scoring pairs are implicit dependencies: change one, you likely need to change the other
-- **Bus factor** (`--add-on bus-factor`) — counts the number of distinct authors who have ever touched each file. Files touched by only one or two people are single points of failure if those people leave
-- **Churn** (`--add-on churn`) — measures change frequency relative to file size: `commit_count / max(1, current_line_count)`. A 20-line file touched 50 times is a hotter spot than a 2000-line file touched 50 times
+- **Bus factor** (`--add-on authors`) — counts the number of distinct authors who have ever touched each file. Files touched by only one or two people are single points of failure if those people leave
+- **Hotspots / churn** (`--add-on hotspot`) — measures change frequency relative to file size: `commit_count / max(1, current_line_count)`. A 20-line file touched 50 times is a hotter spot than a 2000-line file touched 50 times
 - **Caching** — commit stats cached in a per-repo SQLite database by commit hash; subsequent runs are near-instant. The first scan parallelises diff computation across all CPU cores using gitoxide's imara-diff engine so even large repositories index quickly; use `--max-threads` to cap usage on shared machines. Add-on results are also cached in the same database and only recomputed when the commit history or HEAD changes. Database lives in the platform data dir (`~/Library/Application Support/gild/` on macOS), keyed by remote origin URL so local clones and remote URL inputs share the same cache
 - **Memory footprint on large repos** — only numeric commit stats live in memory (~80 bytes per commit). Per-commit file paths are held in a normalized SQLite table and queried on demand by the detail view and file-level add-ons. A 1M-commit repository stays under ~100 MB resident regardless of how many files each commit touched
 
@@ -191,12 +193,20 @@ If your team uses squash merges, contribution data will be skewed toward the per
 - **CSV** — spreadsheet-ready, one row per author
 - **HTML** — self-contained Dracula-themed report with styled table
 
+**Current limitations:** Export and `--print` only output the main author table using the "All time" window. The Files view, Graph view, and time window selection are not yet supported. The HTML export does not support client-side column sorting.
+
+## Roadmap
+
+- **Export view selection** — `--view` flag to export the Files view or Graph view, not just the author table
+- **Export time windows** — `--time` and `--time-offset` flags so exports can target a specific period (year, quarter, month)
+- **Sortable HTML export** — client-side JavaScript so column headers are clickable for sorting
+
 ## Architecture
 
 | File | Role |
 |------|------|
 | `main.rs` | CLI via clap, orchestration |
-| `storage.rs` | Resolves per-repo data dir from origin URL or path hash |
+| `storage.rs` | Resolves per-repo data dir from origin URL or path hash; atomic file writes and safe TOML/text loading |
 | `db.rs` | SQLite connection, schema migrations; tables for `commits` (stats) and `commit_files` (normalized per-commit paths) |
 | `remote.rs` | Detects remote URLs; clones or reuses a local working tree via gix clone/fetch |
 | `git.rs` | Three-phase commit loader via gitoxide (gix): pre-count walk, sequential cache check, parallel diff computation (rayon + imara-diff); file paths emitted as a side channel, not stored on in-memory `Commit` |
@@ -212,7 +222,12 @@ If your team uses squash merges, contribution data will be skewed toward the per
 | `gc.rs` | Prunes unreachable commit/ownership rows from SQLite on startup |
 | `log.rs` | Optional timing log (`--log`) for performance profiling |
 | `app.rs` | State machine: sort, time windows, impact scoring, commit classification, views (Table / Graph / Detail / Files). Owns `Database` for on-demand file-path queries in the detail view |
-| `ui.rs` | Ratatui TUI with Dracula colors, table/graph/detail/files views |
+| `ui/mod.rs` | Ratatui TUI entry: terminal setup, event loop, view dispatch (Dracula colors) |
+| `ui/loading.rs` | Loading screen and progress bar during commit scan / add-on runs |
+| `ui/theme.rs` | Color palette constants (Dracula + Readable themes), gradient stops |
+| `ui/widgets.rs` | Shared rendering helpers: gradients, cell builders, dim/scale color utilities |
+| `ui/views/table.rs` | Author table and graph view rendering |
+| `ui/views/detail.rs` | Per-author detail view rendering |
+| `ui/views/files.rs` | Files view and file-detail (coupling partners) rendering |
 | `export.rs` | JSON, CSV, HTML export |
 | `fmt.rs` | Number/date formatting helpers |
-| `util.rs` | Atomic file writes, safe TOML/text loading |

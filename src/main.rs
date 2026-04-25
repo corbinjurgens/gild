@@ -21,7 +21,6 @@ mod questionnaire;
 mod remote;
 mod storage;
 mod ui;
-mod util;
 
 #[derive(Parser)]
 #[command(
@@ -80,14 +79,11 @@ const ADDON_STEPS: &[(&str, &str, bool)] = &[
 ];
 
 fn addon_label(name: &str) -> &'static str {
-    match name {
-        "ownership" => "Analyzing ownership",
-        "coupling" => "Analyzing file coupling",
-        "authors" => "Analyzing authors",
-        "hotspot" => "Analyzing hotspots",
-        "types" => "Analyzing commit types",
-        _ => unreachable!("validated in main"),
-    }
+    ADDON_STEPS
+        .iter()
+        .find(|&&(n, _, _)| n == name)
+        .map(|&(_, label, _)| label)
+        .unwrap_or_else(|| unreachable!("validated in main"))
 }
 
 fn main() -> Result<()> {
@@ -272,7 +268,7 @@ impl Progress for StderrProgress {
             1000..=9999 => 100,
             _ => 1000,
         };
-        if processed.is_multiple_of(step) {
+        if processed % step == 0 {
             if new > 0 {
                 eprint!("\r  Scanning... {processed} commits ({new} new)");
             } else {
@@ -342,7 +338,9 @@ impl Progress for ChannelProgress {
     }
 
     fn addon_progress(&self, label: &'static str, done: usize, total: usize) {
-        let _ = self.tx.send(ui::LoadMsg::AddonProgress { label, done, total });
+        let _ = self
+            .tx
+            .send(ui::LoadMsg::AddonProgress { label, done, total });
     }
 }
 
@@ -358,11 +356,20 @@ struct LoadParams<'a> {
 }
 
 fn load(p: LoadParams) -> Result<app::App> {
-    let LoadParams { path, db_path, map_path, branch, max_commits, add_ons, logger, progress } = p;
+    let LoadParams {
+        path,
+        db_path,
+        map_path,
+        branch,
+        max_commits,
+        add_ons,
+        logger,
+        progress,
+    } = p;
     progress.step_start("Scanning commits");
 
-    let db = db::Database::open(db_path)?;
-    gc::run(path, &db)?;
+    let mut db = db::Database::open(db_path)?;
+    gc::run(path, &mut db)?;
     if let Some(ref mut l) = logger {
         l.phase_start("cache load");
     }
@@ -403,7 +410,7 @@ fn load(p: LoadParams) -> Result<app::App> {
     if let Some(ref mut l) = logger {
         l.phase_start("cache save");
     }
-    commit_cache.save(&db)?;
+    commit_cache.save(&mut db)?;
 
     if let Some(ref mut l) = logger {
         l.phase_start("identity merge");
@@ -431,7 +438,7 @@ fn load(p: LoadParams) -> Result<app::App> {
         if let Some(ref mut l) = logger {
             l.phase_start(label);
         }
-        match ownership::compute(&repo, &db, &groups, |done, total| {
+        match ownership::compute(&repo, &mut db, &groups, |done, total| {
             progress.addon_progress(label, done, total);
         }) {
             Ok(data) => {
@@ -453,7 +460,7 @@ fn load(p: LoadParams) -> Result<app::App> {
 
     let file_rows = run_file_addons(
         &repo,
-        &db,
+        &mut db,
         add_ons,
         |label| progress.step_start(label),
         |label, done, total| progress.addon_progress(label, done, total),
@@ -494,7 +501,7 @@ fn load(p: LoadParams) -> Result<app::App> {
 
 fn run_file_addons(
     repo: &gix::Repository,
-    db: &db::Database,
+    db: &mut db::Database,
     add_ons: &[String],
     on_step_start: impl Fn(&'static str),
     on_progress: impl Fn(&'static str, usize, usize),
@@ -535,7 +542,7 @@ fn run_file_addons(
         if let Some(ref mut l) = logger {
             l.phase_start(label);
         }
-        if let Ok(rows) = coupling::compute(db, &head_hash, |done, total| {
+        if let Ok(rows) = coupling::compute(repo, db, &head_hash, |done, total| {
             on_progress(label, done, total);
         }) {
             if let Some(ref mut l) = logger {
@@ -555,7 +562,7 @@ fn run_file_addons(
         if let Some(ref mut l) = logger {
             l.phase_start(label);
         }
-        if let Ok(rows) = bus_factor::compute(repo, db, |done, total| {
+        if let Ok(rows) = bus_factor::compute(repo, db, &head_hash, |done, total| {
             on_progress(label, done, total);
         }) {
             if let Some(ref mut l) = logger {
