@@ -11,6 +11,7 @@ readme = "README.md"
 authors = ["Corbin Jurgens <corbinjurgens@gmail.com>"]
 keywords = ["git", "analytics", "tui", "contributions", "blame"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = ["assets/"]
 
 [dependencies]
 anyhow = "1"
