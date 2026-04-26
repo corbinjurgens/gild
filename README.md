@@ -1,6 +1,6 @@
 # Gild — interactive git contribution analyzer
 
-[![Crates.io](https://img.shields.io/crates/v/gild.svg)](https://crates.io/crates/gild)
+[![Crates.io](https://img.shields.io/crates/v/git-gild.svg)](https://crates.io/crates/git-gild)
 [![CI](https://github.com/corbinjurgens/gild/actions/workflows/ci.yml/badge.svg)](https://github.com/corbinjurgens/gild/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
@@ -45,8 +45,10 @@ Most git analytics tools count commits or lines. Gild goes deeper:
 ### Via crates.io (recommended)
 
 ```sh
-cargo install gild
+cargo install git-gild
 ```
+
+The binary is called `gild` — that's the command you'll use after installation.
 
 ### From source
 

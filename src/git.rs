@@ -160,7 +160,11 @@ fn name_from_origin(repo: &gix::Repository) -> Option<String> {
     let path = path.strip_prefix('/').unwrap_or(path);
     let path = path.strip_suffix(".git").unwrap_or(path);
     let path = path.strip_suffix('/').unwrap_or(path);
-    if path.is_empty() { None } else { Some(path.to_string()) }
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
 }
 
 fn resolve_head(repo: &gix::Repository, branch: Option<&str>) -> Result<(String, gix::ObjectId)> {

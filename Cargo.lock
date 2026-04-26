@@ -615,7 +615,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gild"
+name = "git-gild"
 version = "0.2.1"
 dependencies = [
  "anyhow",
