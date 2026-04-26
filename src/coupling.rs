@@ -15,12 +15,13 @@ const MIN_CO_OCCURRENCES: u32 = 3;
 const MIN_SCORE: f64 = 0.1;
 
 pub fn compute(
-    _repo: &gix::Repository,
+    repo: &gix::Repository,
     db: &mut Database,
     head_hash: &str,
     on_progress: impl Fn(usize, usize),
 ) -> Result<Vec<FileCouplingRow>> {
     let key = file_addon_cache_key(db, head_hash)?;
+    let head_files = crate::ownership::walk_tree_sizes(repo);
 
     let cached_count: i64 = db
         .query_row(
@@ -30,7 +31,7 @@ pub fn compute(
         )
         .unwrap_or(0);
     if cached_count > 0 {
-        return load_from_db(db, &key);
+        return load_from_db(db, &key, &head_files);
     }
 
     let total_commits: i64 = db
@@ -95,7 +96,7 @@ pub fn compute(
     }
 
     persist(db, &key, &names, &file_counts, &co_occur)?;
-    load_from_db(db, &key)
+    load_from_db(db, &key, &head_files)
 }
 
 fn accumulate(
@@ -165,7 +166,11 @@ fn persist(
     Ok(())
 }
 
-fn load_from_db(db: &Database, key: &str) -> Result<Vec<FileCouplingRow>> {
+fn load_from_db(
+    db: &Database,
+    key: &str,
+    head_files: &HashMap<String, usize>,
+) -> Result<Vec<FileCouplingRow>> {
     let mut file_counts: HashMap<String, u32> = HashMap::new();
     {
         let mut stmt =
@@ -175,6 +180,9 @@ fn load_from_db(db: &Database, key: &str) -> Result<Vec<FileCouplingRow>> {
         })?;
         for row in rows {
             let (file, count) = row?;
+            if !head_files.contains_key(&file) {
+                continue;
+            }
             file_counts.insert(file, count);
         }
     }

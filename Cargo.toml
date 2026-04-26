@@ -18,7 +18,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 dirs = "6"
-gix = { version = "0.82", features = ["blame", "parallel", "blocking-network-client"] }
+gix = { version = "0.82", features = ["blame", "parallel", "blocking-network-client", "blocking-http-transport-curl"] }
 rayon = "1"
 ratatui = "0.29"
 rusqlite = { version = "0.32", features = ["bundled"] }

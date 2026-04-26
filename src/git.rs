@@ -58,9 +58,8 @@ pub fn load_commits(
 
     let (branch_name, head_target) = resolve_head(&repo, branch)?;
 
-    let repo_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
+    let repo_name = name_from_origin(&repo)
+        .or_else(|| path.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_else(|| "unknown".to_string());
 
     let info = RepoInfo {
@@ -152,6 +151,16 @@ pub fn load_commits(
         .collect::<Result<Vec<_>>>()?;
 
     Ok((info, commits))
+}
+
+fn name_from_origin(repo: &gix::Repository) -> Option<String> {
+    let remote = repo.find_remote("origin").ok()?;
+    let url = remote.url(gix::remote::Direction::Fetch)?;
+    let path = url.path.to_str().ok()?;
+    let path = path.strip_prefix('/').unwrap_or(path);
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let path = path.strip_suffix('/').unwrap_or(path);
+    if path.is_empty() { None } else { Some(path.to_string()) }
 }
 
 fn resolve_head(repo: &gix::Repository, branch: Option<&str>) -> Result<(String, gix::ObjectId)> {

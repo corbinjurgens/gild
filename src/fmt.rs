@@ -31,7 +31,7 @@ impl fmt::Display for Sep {
             }
         }
         // SAFETY: buf only contains ASCII digits (b'0'..=b'9') and b','
-        f.write_str(unsafe { std::str::from_utf8_unchecked(&buf[pos..]) })
+        f.pad(unsafe { std::str::from_utf8_unchecked(&buf[pos..]) })
     }
 }
 

@@ -1,6 +1,34 @@
 # Gild — interactive git contribution analyzer
 
-Fair impact scoring, identity deduplication, code ownership tracking.
+[![Crates.io](https://img.shields.io/crates/v/gild.svg)](https://crates.io/crates/gild)
+[![CI](https://github.com/corbinjurgens/gild/actions/workflows/ci.yml/badge.svg)](https://github.com/corbinjurgens/gild/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
+
+A terminal UI for understanding who did what in a git repository — and how much it mattered.
+
+<p align="center">
+  <img src="assets/demo.png" alt="gild — author table view" width="800">
+</p>
+
+<p align="center">
+  <img src="assets/detail.png" alt="gild — author detail view" width="800">
+</p>
+
+<p align="center">
+  <img src="assets/files.png" alt="gild — files view" width="800">
+</p>
+
+## Why gild?
+
+Most git analytics tools count commits or lines. Gild goes deeper:
+
+- **Fair impact scoring** — a logarithmic formula that weighs lines, files touched, and session consistency. A single clean 200-line commit outscores a flurry of typo fixes with the same total lines. Commit splitting can't game it.
+- **Identity deduplication** — union-find merges authors by email, `.mailmap`, and interactive fuzzy matching. See one entry per person, not five aliases.
+- **Code ownership** — blame-based, not last-touch. Shows who wrote the code that's alive in HEAD today.
+- **File coupling** — finds implicit dependencies: files that always change together.
+- **Bus factor** — surfaces single-author files — your bus-factor risks.
+- **Instant re-runs** — everything cached in SQLite. First run parallelizes diffs across all cores; subsequent runs load in under a second, even on 30k+ commit repos.
 
 ## Requirements
 
@@ -14,35 +42,18 @@ Fair impact scoring, identity deduplication, code ownership tracking.
 
 ## Install
 
-### From source (recommended)
+### Via crates.io (recommended)
+
+```sh
+cargo install gild
+```
+
+### From source
 
 ```sh
 git clone https://github.com/corbinjurgens/gild.git
 cd gild
 cargo install --path .
-```
-
-### Build without installing
-
-```sh
-git clone https://github.com/corbinjurgens/gild.git
-cd gild
-cargo build --release
-./target/release/gild --help
-```
-
-> **Tip for development:** `cargo run` compiles and immediately runs the binary — it is equivalent to `cargo build && ./target/debug/gild`. Use `--` to separate cargo's own flags from gild's arguments:
-> ```sh
-> cargo run -- /path/to/repo              # same as running the binary directly
-> cargo run -- /path/to/repo --add-on coupling
-> cargo run --release -- /path/to/repo   # optimized build
-> ```
-> Once installed via `cargo install`, just use `gild` directly.
-
-### Via cargo (once published)
-
-```sh
-cargo install gild
 ```
 
 ## Usage
@@ -201,33 +212,23 @@ If your team uses squash merges, contribution data will be skewed toward the per
 - **Export time windows** — `--time` and `--time-offset` flags so exports can target a specific period (year, quarter, month)
 - **Sortable HTML export** — client-side JavaScript so column headers are clickable for sorting
 
-## Architecture
+<details>
+<summary><strong>Architecture</strong></summary>
 
 | File | Role |
 |------|------|
 | `main.rs` | CLI via clap, orchestration |
-| `storage.rs` | Resolves per-repo data dir from origin URL or path hash; atomic file writes and safe TOML/text loading |
-| `db.rs` | SQLite connection, schema migrations; tables for `commits` (stats) and `commit_files` (normalized per-commit paths) |
-| `remote.rs` | Detects remote URLs; clones or reuses a local working tree via gix clone/fetch |
-| `git.rs` | Three-phase commit loader via gitoxide (gix): pre-count walk, sequential cache check, parallel diff computation (rayon + imara-diff); file paths emitted as a side channel, not stored on in-memory `Commit` |
-| `cache.rs` | SQLite-backed cache; writes stats to `commits` and paths to `commit_files`, loads stats only |
-| `identity.rs` | Union-find identity merging from email, mailmap, saved rules |
-| `identity_map.rs` | Load/save confirmed merges and rejects (`identities.toml`) |
-| `mailmap.rs` | Parse `.mailmap` for standard git identity mapping |
-| `questionnaire.rs` | Interactive fuzzy identity matcher |
-| `ownership.rs` | Blame-based code ownership via gix-blame (imara-diff engine); `walk_tree_sizes()` shared by churn/bus-factor; SQLite-backed |
-| `coupling.rs` | File co-occurrence matrix; scores pairs by normalized co-commit frequency |
-| `bus_factor.rs` | Counts unique authors per file from commit history; cached per HEAD hash |
-| `churn.rs` | Churn score = commit_count / current_lines; shares `file_stats` with coupling |
-| `gc.rs` | Prunes unreachable commit/ownership rows from SQLite on startup |
-| `log.rs` | Optional timing log (`--log`) for performance profiling |
-| `app.rs` | State machine: sort, time windows, impact scoring, commit classification, views (Table / Graph / Detail / Files). Owns `Database` for on-demand file-path queries in the detail view |
-| `ui/mod.rs` | Ratatui TUI entry: terminal setup, event loop, view dispatch (Dracula colors) |
-| `ui/loading.rs` | Loading screen and progress bar during commit scan / add-on runs |
-| `ui/theme.rs` | Color palette constants (Dracula + Readable themes), gradient stops |
-| `ui/widgets.rs` | Shared rendering helpers: gradients, cell builders, dim/scale color utilities |
-| `ui/views/table.rs` | Author table and graph view rendering |
-| `ui/views/detail.rs` | Per-author detail view rendering |
-| `ui/views/files.rs` | Files view and file-detail (coupling partners) rendering |
+| `storage.rs` | Per-repo data dir resolution, atomic file writes |
+| `db.rs` | SQLite connection, schema migrations |
+| `git.rs` | Three-phase commit loader via gitoxide: pre-count, cache check, parallel diff (rayon + imara-diff) |
+| `cache.rs` | SQLite-backed commit stats + file path cache |
+| `identity.rs` | Union-find identity merging |
+| `ownership.rs` | Blame-based code ownership via gix-blame |
+| `coupling.rs` | File co-occurrence matrix |
+| `bus_factor.rs` | Unique authors per file |
+| `churn.rs` | Change frequency / file size hotspot scoring |
+| `app.rs` | Core state machine: sorting, time windows, impact scoring, views |
+| `ui/` | Ratatui TUI: event loop, Dracula theme, table/graph/detail/files views |
 | `export.rs` | JSON, CSV, HTML export |
-| `fmt.rs` | Number/date formatting helpers |
+
+</details>
