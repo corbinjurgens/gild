@@ -135,17 +135,18 @@ fn env_token() -> Option<String> {
 }
 
 #[allow(clippy::result_large_err)]
-fn env_credentials() -> Option<impl FnMut(helper::Action) -> protocol::Result> {
+fn env_credentials() -> Option<impl FnMut(helper::Action) -> gix::Result<Option<protocol::Outcome>>>
+{
     let token = env_token()?;
     Some(move |action| match action {
         helper::Action::Get(_) => {
-            let identity = gix::sec::identity::Account {
+            let credentials = gix::sec::identity::Credentials::UsernamePassword {
                 username: "x-access-token".into(),
                 password: token.clone(),
                 oauth_refresh_token: None,
             };
             Ok(Some(protocol::Outcome {
-                identity,
+                credentials,
                 next: helper::NextAction::from(protocol::Context::default()),
             }))
         }

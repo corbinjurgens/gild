@@ -260,7 +260,7 @@ fn build_commit(
                     files.push(path.clone());
                     changed_vs_p1.insert(path);
                 }
-                Ok::<_, anyhow::Error>(Action::Continue(()))
+                Ok::<_, gix::Error>(Action::Continue(()))
             })
             .context("tree diff failed")?;
 
@@ -281,7 +281,7 @@ fn build_commit(
                         if !path.is_empty() && changed_vs_p1.contains(&path) {
                             conflict_files.insert(path);
                         }
-                        Ok::<_, anyhow::Error>(Action::Continue(()))
+                        Ok::<_, gix::Error>(Action::Continue(()))
                     });
                 });
 
@@ -307,7 +307,7 @@ fn build_commit(
                                     lines_removed += c.removals as usize;
                                 }
                             }
-                            Ok::<_, anyhow::Error>(Action::Continue(()))
+                            Ok::<_, gix::Error>(Action::Continue(()))
                         })
                         .context("merge conflict diff failed")?;
                 }
@@ -376,7 +376,7 @@ fn build_commit(
                                     }
                                 }
                             }
-                            Ok::<_, std::convert::Infallible>(())
+                            Ok::<_, gix::Error>(())
                         });
                         lines_added += file_added;
                         lines_removed += file_removed;
@@ -390,7 +390,7 @@ fn build_commit(
                     }
                 }
 
-                Ok::<_, anyhow::Error>(Action::Continue(()))
+                Ok::<_, gix::Error>(Action::Continue(()))
             })
             .context("tree diff failed")?;
 
